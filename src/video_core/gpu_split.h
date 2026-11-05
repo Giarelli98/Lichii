@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -13,14 +12,9 @@
 #include <type_traits>
 
 #include "common/common_types.h"
-#include "video_core/split_write_tracker.h"
 
 namespace Core {
 class System;
-}
-
-namespace Tegra {
-class MemoryManager;
 }
 
 namespace Tegra::Engines {
@@ -40,7 +34,6 @@ enum class DrainSite : u32 {
     ListSync,       ///< Command lists on draw-written pages: the work before the last host sync
     ListFlush,      ///< Command lists on GPU-written pages: drain and flush the pages
     MacroDmaRead,   ///< The front's macros read memory (MME DMA)
-    MacroDmaWrites, ///< The same, waiting only for the queued work that may write it
     MacroDmaFlush,  ///< Those words are in the buffer cache
     GpSyncFence,    ///< A GP entry's sync bit (sync_memory_operations)
     Map,            ///< GPU memory maps before later command reads
@@ -51,8 +44,7 @@ enum class DrainSite : u32 {
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
-    "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
-    "macro dma flush",
+    "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",
 };
 
@@ -116,10 +108,8 @@ public:
 
     /// An engine method write, executed as DmaPusher would (method sink, ConsumeSink, call).
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
-    /// `effect`: what the entry may write (SplitWriteTracker; unknown unless the caller knows).
-    using Effect = SplitWriteTracker::Effect;
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
-                const GPUVAddr* segment, Effect effect = Effect::Unknown) {
+                const GPUVAddr* segment) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -129,31 +119,29 @@ public:
         if (segment != nullptr) {
             entry[1] = *segment;
         }
-        Commit(words, effect);
+        Commit(words);
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                     u32 amount, u32 methods_pending, const GPUVAddr* segment,
-                     Effect effect = Effect::Unknown);
+                     u32 amount, u32 methods_pending, const GPUVAddr* segment);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
-    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
-                    Effect effect = Effect::Unknown) {
+    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
-        Commit(1, effect);
+        Commit(1);
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     template <typename Func>
-    void Defer(const Func& func, Effect effect = Effect::Unknown) {
+    void Defer(const Func& func) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
         entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
-        Commit(2 + payload, effect);
+        Commit(2 + payload);
     }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
@@ -195,29 +183,6 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
-    /// The entry just sent also writes [address, address + size) of `memory`, noted by device
-    /// page (other mappings may alias it, and the caches keep state per page).
-    void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
-    /// The entry just sent writes guest memory the front can't tell.
-    void NoteUnknownWrite() {
-        writes.Entry(Effect::Unknown, write_position);
-    }
-    /// Waits for the queued functions (GPU memory maps among them) before the front translates
-    /// addresses, then drops the pending writes the back has run. Returns the back's position.
-    u64 SettleWrites();
-    /// Ring position the back must pass to execute possible writers of [begin, end).
-    /// Deferred fence writes can still be pending afterwards.
-    [[nodiscard]] u64 ReadTarget(u64 begin, u64 end) const {
-        return writes.ReadTarget(begin, end);
-    }
-    [[nodiscard]] const SplitWriteTracker& Writes() const {
-        return writes;
-    }
-    /// Waits until the back consumed `position` (not what came after). Returns whether it had
-    /// not yet.
-    bool WaitUntil(u64 position, DrainSite site) {
-        return WaitFor((std::min)(position, write_position), site);
-    }
 
 private:
     friend struct GpuSplitTestAccess;
@@ -253,9 +218,8 @@ private:
         return ReserveSlow(words);
     }
     u64* ReserveSlow(size_t words);
-    void Commit(size_t words, Effect effect) {
+    void Commit(size_t words) {
         write_position += words;
-        writes.Entry(effect, write_position);
         if (write_position - published_local >= publish_every) {
             Publish();
         }
@@ -292,14 +256,6 @@ private:
     u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
-    u64 last_function_position{};
-    SplitWriteTracker writes;
-    /// NoteWrite's last translation: memory manager, GPU page, device page, the function
-    /// position it was made at (a later function may remap).
-    const Tegra::MemoryManager* note_memory{};
-    GPUVAddr note_page{~GPUVAddr{0}};
-    u64 note_device{};
-    u64 note_function{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

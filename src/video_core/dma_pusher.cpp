@@ -51,13 +51,10 @@ void DmaPusher::DispatchCalls() {
         }
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        // Submits and releases signaled fences: their writes belong to the entries that queued them.
-        split.Defer(
-            [gpu = &system.GPU()] {
-                gpu->FlushCommands();
-                gpu->OnCommandListEnd();
-            },
-            VideoCommon::GpuSplit::Effect::None);
+        split.Defer([gpu = &system.GPU()] {
+            gpu->FlushCommands();
+            gpu->OnCommandListEnd();
+        });
         split.Publish();
         return;
     }
@@ -144,12 +141,10 @@ bool DmaPusher::Step() {
                 auto* const engine_state = subchannels[dma_state.subchannel];
                 if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
-                    split.Defer(
-                        [engine_state, memory = &memory_manager,
-                         address = GPUVAddr{dma_state.dma_get}, bytes = words * sizeof(u32)] {
-                            engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
-                        },
-                        VideoCommon::GpuSplit::Effect::None);
+                    split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
+                                 bytes = words * sizeof(u32)] {
+                        engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
+                    });
                 } else {
                     engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
                 }
@@ -466,11 +461,6 @@ void DmaPusher::CallMethod(u32 argument) {
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
                             engine_type == Engines::EngineTypes::MaxwellDMA;
-        // Copies and blits are GPU work for the front's reads (GpuSplit::Effect).
-        const auto effect = engine_type == Engines::EngineTypes::MaxwellDMA ||
-                                    engine_type == Engines::EngineTypes::Fermi2D
-                                ? VideoCommon::GpuSplit::Effect::Gpu
-                                : VideoCommon::GpuSplit::Effect::Unknown;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
@@ -497,7 +487,7 @@ void DmaPusher::CallMethod(u32 argument) {
                 }
             }
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
-                         WantsSegment() ? &segment : nullptr, effect);
+                         WantsSegment() ? &segment : nullptr);
             return;
         }
         if (!subchannel->execution_mask[dma_state.method]) {
@@ -530,11 +520,6 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
                             engine_type == Engines::EngineTypes::MaxwellDMA;
-        // Copies and blits are GPU work for the front's reads (GpuSplit::Effect).
-        const auto effect = engine_type == Engines::EngineTypes::MaxwellDMA ||
-                                    engine_type == Engines::EngineTypes::Fermi2D
-                                ? VideoCommon::GpuSplit::Effect::Gpu
-                                : VideoCommon::GpuSplit::Effect::Unknown;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
@@ -561,7 +546,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                 }
             }
             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
-                              dma_state.method_count, WantsSegment() ? &segment : nullptr, effect);
+                              dma_state.method_count, WantsSegment() ? &segment : nullptr);
             return;
         }
         VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};

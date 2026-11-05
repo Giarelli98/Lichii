@@ -919,7 +919,7 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
             const std::span<u8> dst = output.subspan(host_offset);
             const std::span<const u8> src = input.subspan(guest_offset + guest_layer_offset);
-            if (!worker || !Nx2Perf::On(Nx2Perf::Opt::UnswizzleWorkers) ||
+            if (!worker ||
                 info.type != ImageType::e2D || info.num_samples != 1 ||
                 !worker->TryUnswizzle(
                     dst.first(host_bytes_per_layer), src.first(level_sizes[level]), 1U << bpp_log2,

@@ -20,7 +20,6 @@
 #include "core/device_memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/memory_manager.h"
-#include "video_core/nx2_perf.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/textures/unswizzle_worker.h"
@@ -234,7 +233,6 @@ TEST_CASE("Independent owners can share the texture pool", "[unswizzle_workers]"
 
 TEST_CASE("Full upload keeps mip layer offsets and compressed edge blocks", "[unswizzle_workers]") {
     using namespace VideoCommon;
-    REQUIRE_FALSE(Nx2Perf::On(Nx2Perf::Opt::SplitOverlap));
     ScopedSystemTestContext context;
     Core::System system;
     Core::DeviceMemory physical;

@@ -713,7 +713,6 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
     // Runs already sorted with gaps between them (the buffer tracker's) are what the sort and
     // merge below would produce: use them as they are instead of two heap copies.
     const bool separated =
-        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::SortedPageBatches) &&
         std::ranges::adjacent_find(ranges, [](const auto& a, const auto& b) {
             return a.first > b.first || a.first + a.second >= b.first;
         }) == ranges.end();

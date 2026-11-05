@@ -1,9 +1,8 @@
 # Native graphics pipeline worker emission
 
-This experimental track moves native graphics SPIR-V emission and shader-module creation from
-GPUBack to `VkPipelineBuilder`. It does **not** move guest-dependent IR translation. The
-`async_pipelines` Nx2Perf switch defaults on. `EDEN_NX2_PERF_OFF=async_pipelines` or
-`EDEN_NX2_PERF_OPT=0` restores the original build path.
+Native graphics SPIR-V emission and shader-module creation run on `VkPipelineBuilder` when
+an emission reservation is available. Guest-dependent IR translation remains on GPUBack.
+Legacy programs and a full reservation budget retain synchronous emission.
 
 ## Why the old path still stalls GPUBack
 
@@ -95,4 +94,5 @@ and emission. No Ocarina runtime measurements or Windows build are claimed for t
 The reported 0.2–2.3 seconds per 10 seconds does not establish an FPS improvement. This change
 can overlap only the emission fraction with useful GPUBack work, and queue delays, allocation,
 and remaining draw holds can reduce that benefit. Its actual savings require
-equivalent cold-cache sessions with the switch on and off, not a warmed-cache second run.
+equivalent cold-cache sessions against the original synchronous implementation, not a
+warmed-cache second run.

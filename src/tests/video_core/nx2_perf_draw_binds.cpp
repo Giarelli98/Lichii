@@ -16,12 +16,11 @@
 #include "common/slot_vector.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
-#include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 
 namespace {
 
-// UsageTracker::Track before the full-page run (Nx2Perf off).
+// UsageTracker::Track before the full-page run.
 class OldUsageTracker {
     static constexpr size_t BUFFER_BYTES_PER_BITSHIFT = 6;
     static constexpr size_t BUFFER_PAGE_SHIFT = 6 + BUFFER_BYTES_PER_BITSHIFT;
@@ -196,7 +195,6 @@ TEST_CASE("Nx2Perf draw-binds: clean words survive manager pool growth", "[video
 }
 
 TEST_CASE("Nx2Perf draw-binds: UsageTracker run matches the old Track", "[video_core]") {
-    REQUIRE(VideoCommon::Nx2Perf::Enabled());
     constexpr u64 buffer_size = 24ULL << 20;
     std::mt19937_64 rng{0x0400486024DEC000ULL};
     VideoCommon::UsageTracker tracker{buffer_size};

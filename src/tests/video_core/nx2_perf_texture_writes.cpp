@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
-#include <cstdlib>
 #include <random>
 #include <span>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -18,7 +16,6 @@
 #include "core/device_memory.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
-#include "video_core/nx2_perf.h"
 
 namespace {
 
@@ -123,18 +120,6 @@ Runs RandomCollected(std::mt19937_64& rng, VAddr base) {
 }
 
 } // Anonymous namespace
-
-TEST_CASE("Nx2Perf texture-writes: switches can be disabled independently", "[video_core]") {
-    using namespace VideoCommon::Nx2Perf;
-    const char* master = std::getenv("EDEN_NX2_PERF_OPT");
-    const char* disabled = std::getenv("EDEN_NX2_PERF_OFF");
-    const bool enabled = master == nullptr || master[0] != '0';
-    const std::string list = "," + std::string{disabled ? disabled : ""} + ",";
-    REQUIRE(On(Opt::WriteIntersections) ==
-            (enabled && list.find(",write_intersections,") == std::string::npos));
-    REQUIRE(On(Opt::SortedPageBatches) ==
-            (enabled && list.find(",sorted_page_batches,") == std::string::npos));
-}
 
 TEST_CASE("Nx2Perf texture-writes: in-place tracker merge matches the old copy", "[video_core]") {
     std::mt19937_64 rng{0x0400486024DEC000ULL};

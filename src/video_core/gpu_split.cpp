@@ -27,7 +27,6 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
-#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 
 namespace VideoCommon {
@@ -142,10 +141,6 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_sync_position = 0;
-    last_function_position = 0;
-    writes.Reset();
-    note_memory = nullptr;
-    note_page = ~GPUVAddr{0};
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -265,7 +260,7 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         Pause();
         return;
     }
-    if (!Nx2Perf::On(Nx2Perf::Opt::FrontSleep) || !back_running.load(std::memory_order_acquire)) {
+    if (!back_running.load(std::memory_order_acquire)) {
         std::this_thread::yield();
         return;
     }
@@ -284,12 +279,11 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
     u64* const entry = Reserve(2);
     entry[0] = static_cast<u64>(Kind::Engine);
     entry[1] = reinterpret_cast<u64>(engine);
-    Commit(2, Effect::None);
+    Commit(2);
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                           u32 amount, u32 methods_pending, const GPUVAddr* segment,
-                           Effect effect) {
+                           u32 amount, u32 methods_pending, const GPUVAddr* segment) {
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -306,7 +300,7 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         }
         entry[size - 1] = 0;
         std::memcpy(entry + head, words, size_t{piece} * sizeof(u32));
-        Commit(size, effect);
+        Commit(size);
         words += piece;
         amount -= piece;
         methods_pending -= piece;
@@ -319,44 +313,6 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
         (*heap)();
         delete heap;
     });
-    last_function_position = write_position;
-}
-
-void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
-    if (size == 0 || !Nx2Perf::On(Nx2Perf::Opt::SplitOverlap)) {
-        return;
-    }
-    // While a queued function may still change the GPU mappings, the back may translate the
-    // address differently. Sparse pages are written through their own backing.
-    const bool sparse = address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
-                        Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < address + size;
-    if (last_function_position > consumed_cache || sparse) {
-        writes.Entry(Effect::Unknown, write_position);
-        return;
-    }
-    constexpr GPUVAddr page_mask = ~GPUVAddr{0xfff};
-    for (GPUVAddr page = address & page_mask; page < address + size; page += 0x1000) {
-        if (&memory != note_memory || page != note_page || note_function != last_function_position) {
-            const std::optional<DAddr> device = memory.GpuToCpuAddress(page);
-            if (!device) {
-                note_memory = nullptr;
-                writes.Entry(Effect::Unknown, write_position);
-                return;
-            }
-            note_memory = &memory;
-            note_page = page;
-            note_device = *device & page_mask;
-            note_function = last_function_position;
-        }
-        writes.Write(note_device, note_device + 0x1000, write_position);
-    }
-}
-
-u64 GpuSplit::SettleWrites() {
-    WaitFor((std::min)(last_function_position, write_position), DrainSite::Map);
-    consumed_cache = consumed.load(std::memory_order_acquire);
-    writes.Retire(consumed_cache);
-    return consumed_cache;
 }
 
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
@@ -377,8 +333,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             using Tegra::Engines::Maxwell3D;
             auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
             constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
-            if (method - cb_data < 16 && (head & HasSegment) == 0 &&
-                Nx2Perf::On(Nx2Perf::Opt::CbBatch)) {
+            if (method - cb_data < 16 && (head & HasSegment) == 0) {
                 // Single constant buffer words in a row (macros write them one by one) go up in
                 // one write. They are executable: each entry would only consume the sink first.
                 std::array<u32, 64> methods;

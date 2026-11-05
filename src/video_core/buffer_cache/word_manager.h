@@ -293,7 +293,7 @@ struct WordManager {
         if (ranges.empty())
             return;
         std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-        if (Nx2Perf::On(Nx2Perf::Opt::SortedPageBatches) && !Nx2Perf::Verify()) {
+        if (!Nx2Perf::Verify()) {
             CoalesceInPlace(ranges);
             tracker->UpdatePagesCachedBatch(
                 std::span<const std::pair<VAddr, size_t>>(ranges.data(), ranges.size()), delta);
@@ -315,14 +315,12 @@ struct WordManager {
             }
         }
         coalesced.emplace_back(cur_addr, cur_size);
-        if (Nx2Perf::On(Nx2Perf::Opt::SortedPageBatches)) {
-            CoalesceInPlace(ranges);
-            static std::atomic<u32> logged{};
-            if (!std::ranges::equal(ranges, coalesced) &&
-                logged.fetch_add(1, std::memory_order_relaxed) < 64) {
-                LOG_ERROR(HW_GPU, "Nx2Perf texture-writes: tracker runs from {:#x} coalesced differently",
-                          coalesced.front().first);
-            }
+        CoalesceInPlace(ranges);
+        static std::atomic<u32> logged{};
+        if (!std::ranges::equal(ranges, coalesced) &&
+            logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_ERROR(HW_GPU, "Nx2Perf texture-writes: tracker runs from {:#x} coalesced differently",
+                      coalesced.front().first);
         }
         // Use batch API to reduce lock acquisitions and contention.
         tracker->UpdatePagesCachedBatch(coalesced, delta);
