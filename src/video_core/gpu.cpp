@@ -10,6 +10,9 @@
 #include <condition_variable>
 #include <list>
 #include <memory>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 #include "common/assert.h"
@@ -231,12 +234,37 @@ struct GPU::Impl {
             return raster_area;
         }
         raster_area.preemtive = true;
+        // EDEN_NX2_CPUREAD_LAG=1: a page the guest CPU reads back again and again (Ocarina of
+        // Time reads one ~30-60 times a second, its exposure) is downloaded without the CPU
+        // waiting for the GPU: the read sees the value of the previous download, a frame late,
+        // instead of stalling the game thread until the GPU thread caught up. Pages read fewer
+        // than 16 times keep the synchronous flush.
+        static const bool lag_reads = [] {
+            const char* v = std::getenv("EDEN_NX2_CPUREAD_LAG");
+            return v && v[0] == '1';
+        }();
+        bool lagged = false;
+        if (lag_reads) {
+            static std::mutex lag_mutex;
+            static std::unordered_map<DAddr, u32> lag_pages;
+            std::scoped_lock lock{lag_mutex};
+            lagged = ++lag_pages[raster_area.start_address] > 16;
+        }
+        static std::atomic<u64> reads{};
+        static std::atomic<u64> waited_us{};
+        static std::atomic<u64> lagged_reads{};
+        const u64 n = reads.fetch_add(1, std::memory_order_relaxed);
+        if (lagged) {
+            lagged_reads.fetch_add(1, std::memory_order_relaxed);
+        }
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
-        if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
-            LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far)",
-                     raster_area.start_address, raster_area.end_address,
-                     reads.load(std::memory_order_relaxed));
+        if ((n & 63) == 0) {
+            LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far, {} lagged, "
+                     "CPU waited {} us in all)",
+                     raster_area.start_address, raster_area.end_address, n + 1,
+                     lagged_reads.load(std::memory_order_relaxed),
+                     waited_us.load(std::memory_order_relaxed));
         }
         const u64 fence = RequestSyncOperation([this, raster_area]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
@@ -244,7 +272,15 @@ struct GPU::Impl {
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
         });
         gpu_thread.TickGPU(is_async);
+        if (lagged) {
+            return raster_area;
+        }
+        const auto wait_start = std::chrono::steady_clock::now();
         WaitForSyncOperation(fence);
+        waited_us.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                 std::chrono::steady_clock::now() - wait_start)
+                                                 .count()),
+                            std::memory_order_relaxed);
         return raster_area;
     }
 
