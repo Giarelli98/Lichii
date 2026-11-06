@@ -438,6 +438,19 @@ bool DriverCachesPipelines(const Device& device) {
         return false;
     }
 }
+// EDEN_NX2_PREBUILD=<count>: how many cached pipelines that recent sessions did not use are built
+// in the background after boot (default 64). The rest are built, their shaders translated on the
+// GPU thread, the first time a draw needs one: a stutter turning the camera onto something not
+// seen for a while (Ocarina of Time skipped ~980 at boot).
+size_t PrebuildCapacity() {
+    static const size_t capacity = [] {
+        const char* value = std::getenv("EDEN_NX2_PREBUILD");
+        const size_t parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+        return parsed != 0 ? (std::min<size_t>)(parsed, 8192) : size_t{64};
+    }();
+    return capacity;
+}
+
 } // Anonymous namespace
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
@@ -717,19 +730,6 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
 // memory built before the game started; the list is only saved at exit or after two minutes, so a
 // boot that ran out of memory never saved one and the next boot did the same.
 constexpr size_t MaxPipelinesWithoutUsedList = 3000;
-
-// EDEN_NX2_PREBUILD=<count>: how many cached pipelines that recent sessions did not use are built
-// in the background after boot (default 64). The rest are built, their shaders translated on the
-// GPU thread, the first time a draw needs one: a stutter turning the camera onto something not
-// seen for a while (Ocarina of Time skipped ~980 at boot).
-size_t PrebuildCapacity() {
-    static const size_t capacity = [] {
-        const char* value = std::getenv("EDEN_NX2_PREBUILD");
-        const size_t parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
-        return parsed != 0 ? (std::min<size_t>)(parsed, 8192) : size_t{64};
-    }();
-    return capacity;
-}
 
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
