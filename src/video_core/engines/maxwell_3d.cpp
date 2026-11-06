@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <unordered_map>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -1343,6 +1345,20 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     }
 }
 
+namespace {
+// EDEN_NX2_DMA_LEARN=1: macro DMA reads from pages that never changed across a drain skip the
+// drain (front thread only). Every 64th read re-verifies; any change makes the page sticky.
+struct DmaLearnPage {
+    u32 seen{};
+    bool sticky{};
+};
+const bool g_dma_learn = [] {
+    const char* v = std::getenv("EDEN_NX2_DMA_LEARN");
+    return v && v[0] == '1';
+}();
+std::unordered_map<u64, DmaLearnPage> g_dma_learn_pages;
+} // namespace
+
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
                              u32 method, u32 count) {
     // The words may be written by methods still queued for the back (indirect draw arguments
@@ -1357,7 +1373,29 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    bool skip_drain = false;
+    std::vector<u32> learn_before;
+    DmaLearnPage* learn_page = nullptr;
+    if (g_dma_learn && words <= 64) {
+        learn_page = &g_dma_learn_pages[source >> 12];
+        const u32 n = learn_page->seen++;
+        const bool verify = n < 32 || (n & 63) == 0;
+        skip_drain = !learn_page->sticky && !verify;
+        if (!skip_drain && !learn_page->sticky) {
+            learn_before.resize(words);
+            memory_manager.ReadBlockUnsafe(source, learn_before.data(), read_bytes);
+        }
+    }
+    if (!skip_drain) {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+        if (!learn_before.empty()) {
+            std::vector<u32> after(words);
+            memory_manager.ReadBlockUnsafe(source, after.data(), read_bytes);
+            if (after != learn_before) {
+                learn_page->sticky = true;
+            }
+        }
+    }
     if (VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
             [this, macro, method, source, read_bytes] {
