@@ -167,6 +167,10 @@ public:
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
 
+    /// Words sent that the back has not consumed yet (front thread; a snapshot).
+    u64 Pending() const {
+        return write_position - consumed.load(std::memory_order_acquire);
+    }
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
         last_writer_position = write_position;

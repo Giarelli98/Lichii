@@ -1357,6 +1357,7 @@ const bool g_dma_learn = [] {
     return v && v[0] == '1';
 }();
 std::unordered_map<u64, DmaLearnPage> g_dma_learn_pages;
+u32 g_dma_learn_skips{};
 } // namespace
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
@@ -1380,7 +1381,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         learn_page = &g_dma_learn_pages[source >> 12];
         const u32 n = learn_page->seen++;
         const bool verify = n < 32 || (n & 63) == 0;
-        skip_drain = !learn_page->sticky && !verify;
+        // Bounded run-ahead: a skipped drain lets the front get ahead of the back; past this
+        // backlog (or this many skips in a row) the drain is taken, so a later one never meets
+        // a deep queue (that was the 1% lows of EDEN_NX2_DMA_LEARN).
+        constexpr u64 MaxPendingWords = 1u << 12;
+        constexpr u32 MaxSkipsInRow = 16;
+        const bool bounded = split.Pending() < MaxPendingWords && g_dma_learn_skips < MaxSkipsInRow;
+        skip_drain = !learn_page->sticky && !verify && bounded;
+        g_dma_learn_skips = skip_drain ? g_dma_learn_skips + 1 : 0;
         if (!skip_drain && !learn_page->sticky) {
             learn_before.resize(words);
             memory_manager.ReadBlockUnsafe(source, learn_before.data(), read_bytes);
