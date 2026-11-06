@@ -2903,7 +2903,6 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
 }
 
 template <class P>
-template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                              StorageBindingPolicy policy) const {
                                                  const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
