@@ -1091,6 +1091,13 @@ bool FrontSkipSame() {
     return skip;
 }
 
+// EDEN_NX2_MULTI_SKIP=1: a run of words to one plain state register that all keep its value is
+// not sent to the back (FrontWrite already drops the single-word case).
+const bool g_multi_skip = [] {
+    const char* v = std::getenv("EDEN_NX2_MULTI_SKIP");
+    return v && v[0] == '1';
+}();
+
 } // Anonymous namespace
 
 Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSplit& split) {
@@ -1240,6 +1247,24 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         fs.draw_pending = true;
     } else {
+        if (g_multi_skip && fs.skip_same && !execution_mask[method] && amount != 0 &&
+            fs.control != Regs::ShadowRamControl::Replay) {
+            // Every word keeps the register's value (and the shadow copy's when it is tracked):
+            // nothing would change on the back.
+            const u32 current = fs.regs[method];
+            const bool shadow_tracked = tracked();
+            bool all_same = true;
+            for (u32 i = 0; i < amount && all_same; ++i) {
+                all_same = base_start[i] == current && (!shadow_tracked || fs.shadow[method] == current);
+            }
+            if (all_same) {
+                if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+                    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::SameValueWrites,
+                                                 amount);
+                }
+                return;
+            }
+        }
         // CallMethod for each word, macro uploads among them (load_mme.instruction). A word may
         // change the shadow RAM mode for the next (a run of SET_SHADOW_RAM_CONTROL writes).
         for (u32 i = 0; i < amount; ++i) {
