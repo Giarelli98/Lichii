@@ -1036,6 +1036,9 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// The last draw.begin was InstanceId::Subsequent and only instance-loop methods followed:
+    /// the back's draw mode is Instance, where draw.end does nothing (DrawManager::DrawEnd).
+    bool instance_loop{};
 };
 
 namespace {
@@ -1098,6 +1101,16 @@ const bool g_multi_skip = [] {
     return v && v[0] == '1';
 }();
 
+// EDEN_NX2_LOOP_SKIP=1: instance-loop writes that change nothing on the back are not sent: a
+// same-value vertex_buffer.first/count or index_buffer.first (the draw manager only stores them,
+// and they never end a deferred draw), and a same-value draw.end inside an instance loop. NVN's
+// draw macros re-send these for every instance: ~600,000 back method calls a second in Ocarina
+// of Time's Kokiri Forest.
+const bool g_loop_skip = [] {
+    const char* v = std::getenv("EDEN_NX2_LOOP_SKIP");
+    return v && v[0] == '1';
+}();
+
 } // Anonymous namespace
 
 Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSplit& split) {
@@ -1151,6 +1164,35 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
         fs.regs[method] = value;
     } else {
+        if (g_loop_skip) {
+            const bool same = fs.regs[method] == value && shadow_kept && fs.skip_same;
+            bool skip = false;
+            switch (method) {
+            case MAXWELL3D_REG_INDEX(draw.begin):
+                fs.instance_loop = static_cast<Regs::Draw::InstanceId>((value >> 26) & 3) ==
+                                   Regs::Draw::InstanceId::Subsequent;
+                break;
+            case MAXWELL3D_REG_INDEX(draw.end):
+                skip = same && fs.instance_loop;
+                break;
+            case MAXWELL3D_REG_INDEX(vertex_buffer.first):
+            case MAXWELL3D_REG_INDEX(vertex_buffer.count):
+            case MAXWELL3D_REG_INDEX(index_buffer.first):
+                skip = same;
+                break;
+            case MAXWELL3D_REG_INDEX(index_buffer.count):
+                break;
+            default:
+                fs.instance_loop = false;
+                break;
+            }
+            if (skip) {
+                if (Profile::Enabled()) [[unlikely]] {
+                    Profile::Add(Profile::Counter::SameValueWrites, 1);
+                }
+                return;
+            }
+        }
         fs.regs[method] = value;
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         switch (method) {
@@ -1230,6 +1272,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         return fs.control == Regs::ShadowRamControl::Track ||
                fs.control == Regs::ShadowRamControl::TrackWithFilter;
     };
+    fs.instance_loop = false;
     if (method >= cb_data && method < cb_data + 16) {
         fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += amount * sizeof(u32);
     } else if (method == MAXWELL3D_REG_INDEX(inline_data)) {
