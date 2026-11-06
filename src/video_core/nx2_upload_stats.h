@@ -36,6 +36,14 @@ inline constexpr std::array<const char*, static_cast<size_t>(Path::Count)> names
     "deduplicated",
 };
 
+struct DedupStats {
+    u64 same{}, same_bytes{}, skipped{}, skipped_bytes{}, gpu_written_same{};
+};
+inline DedupStats& GetDedupStats() {
+    static DedupStats stats;
+    return stats;
+}
+
 struct Totals {
     u64 count{};
     u64 bytes{};
@@ -126,14 +134,6 @@ inline u64 Hash(const u8* data, size_t size) {
     h *= 0xC4CEB9FE1A85EC53ULL;
     h ^= h >> 29;
     return h | 1;
-}
-
-struct DedupStats {
-    u64 same{}, same_bytes{}, skipped{}, skipped_bytes{}, gpu_written_same{};
-};
-inline DedupStats& GetDedupStats() {
-    static DedupStats stats;
-    return stats;
 }
 
 class Timer {
