@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "common/page_table.h"
 #include "core/core.h"
@@ -120,6 +121,10 @@ struct Runtime {
         waited_tick = tick;
         ++waits;
     }
+    void FinishForHostRead() {
+        ++host_read_barriers;
+        Finish();
+    }
     void BindUniformBuffer(Buffer&, u32, u32) {}
     std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
         stream.resize(size);
@@ -128,6 +133,7 @@ struct Runtime {
 
     u32 alignment{256};
     u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{};
+    u32 host_read_barriers{};
     u64 upload_bytes{}, waited_tick{};
     std::unique_ptr<Buffer> staging;
     std::vector<u8> stream;
@@ -395,7 +401,7 @@ TEST_CASE("Batch downloads clamp buffers, deduplicate pages and finish before pu
     REQUIRE(f.runtime.finishes == 1);
 }
 
-TEST_CASE("Mapped batch waits for latest use and mixed batch needs one completion",
+TEST_CASE("Mapped and mixed batches make device writes host visible in one completion",
           "[buffer_ports]") {
     Fixture f;
     const auto first = Access::Add(*f.cache, 0x20000, 0x10000, true);
@@ -414,13 +420,16 @@ TEST_CASE("Mapped batch waits for latest use and mixed batch needs one completio
     Access::Dirty(*f.cache, 0x20000, 0x1000);
     Access::Dirty(*f.cache, 0x30000, 0x1000);
     f.runtime.before_completion = [&] {
+        REQUIRE(f.runtime.host_read_barriers == 1);
+        REQUIRE(f.bytes[0x10000] == 0);
+        REQUIRE(f.bytes[0x20000] == 0);
         std::ranges::fill(a.bytes, 0x56);
         std::ranges::fill(b.bytes, 0x78);
     };
     Access::Download(*f.cache, ranges);
-    REQUIRE(f.runtime.waits == 1);
-    REQUIRE(f.runtime.waited_tick == 19);
-    REQUIRE(f.runtime.finishes == 0);
+    REQUIRE(f.runtime.waits == 0);
+    REQUIRE(f.runtime.host_read_barriers == 1);
+    REQUIRE(f.runtime.finishes == 1);
     REQUIRE(f.runtime.allocations == 0);
     REQUIRE(f.bytes[0x10000] == 0x56);
     REQUIRE(f.bytes[0x20000] == 0x78);
@@ -428,21 +437,49 @@ TEST_CASE("Mapped batch waits for latest use and mixed batch needs one completio
     Access::Dirty(*f.cache, 0x20000, 0x1000);
     Access::Dirty(*f.cache, 0x30000, 0x1000);
     f.runtime.before_completion = [&] {
+        REQUIRE(f.runtime.host_read_barriers == 2);
+        REQUIRE(f.bytes[0x10000] == 0x56);
+        REQUIRE(f.bytes[0x20000] == 0x78);
         std::ranges::fill(a.bytes, 0x9a);
         std::ranges::fill(b.bytes, 0xbc);
     };
     Access::Download(*f.cache, ranges);
-    REQUIRE(f.runtime.waits == 1);
-    REQUIRE(f.runtime.finishes == 1);
+    REQUIRE(f.runtime.waits == 0);
+    REQUIRE(f.runtime.finishes == 2);
     REQUIRE(f.runtime.downloads == 1);
     REQUIRE(f.bytes[0x10000] == 0x9a);
     REQUIRE(f.bytes[0x20000] == 0xbc);
+    Access::Download(*f.cache, ranges);
+    REQUIRE(f.runtime.host_read_barriers == 2);
+    REQUIRE(f.runtime.finishes == 2);
+}
+
+TEST_CASE("Single mapped download completes host visibility before guest publication",
+          "[buffer_ports]") {
+    Fixture f;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000, true);
+    auto& buffer = Access::Get(*f.cache, id);
+    buffer.tick = 7;
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    f.runtime.before_completion = [&] {
+        REQUIRE(f.runtime.host_read_barriers == 1);
+        REQUIRE(f.bytes[0x10000] == 0);
+        std::ranges::fill(buffer.bytes, 0xcd);
+    };
+    f.cache->DownloadMemory(0x20000, 0x1000);
+    REQUIRE(f.runtime.finishes == 1);
+    REQUIRE(f.runtime.waits == 0);
+    REQUIRE(f.runtime.allocations == 0);
+    REQUIRE(f.bytes[0x10000] == 0xcd);
+    f.cache->DownloadMemory(0x20000, 0x1000);
+    REQUIRE(f.runtime.finishes == 1);
 }
 
 TEST_CASE("Command page batch publishes only completed matching write generations",
           "[buffer_ports]") {
     Fixture f;
-    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    const bool mapped = GENERATE(false, true);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000, mapped);
     std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x42);
     Access::Dirty(*f.cache, 0x20000, 0x3000);
     Access::DrawWrite(*f.cache, 0x20000);
@@ -451,13 +488,15 @@ TEST_CASE("Command page batch publishes only completed matching write generation
     std::array<u8, 4> out{};
     using Read = Cache::Nx2ListRead;
     f.runtime.before_completion = [&] {
+        REQUIRE(f.runtime.host_read_barriers == 1);
+        REQUIRE(f.bytes[0x10000] == 0);
         REQUIRE(f.cache->Nx2ReadListCopy(0x20000, out, true) == Read::Unknown);
         Access::DrawWrite(*f.cache, 0x22000);
     };
     const std::array<DAddr, 1> requested{0x20000};
     f.cache->Nx2FlushListPages(requested);
     REQUIRE(f.runtime.finishes == 1);
-    REQUIRE(f.runtime.downloads == 3);
+    REQUIRE(f.runtime.downloads == (mapped ? 0 : 3));
     REQUIRE(f.cache->Nx2ReadListCopy(0x20000, out, true) == Read::Synced);
     REQUIRE(f.cache->Nx2ReadListCopy(0x21000, out, true) == Read::Synced);
     REQUIRE(f.cache->Nx2ReadListCopy(0x22000, out, true) == Read::Unknown);

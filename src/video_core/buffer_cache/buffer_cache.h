@@ -344,10 +344,7 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges) {
-    constexpr bool has_mapped = requires(Buffer& buffer) {
-        buffer.Mapped();
-        buffer.LastUsageTick();
-    };
+    constexpr bool has_mapped = requires(Buffer& buffer) { buffer.Mapped(); };
     if constexpr (!USE_MEMORY_MAPS) {
         for (const auto& [device_addr, size] : ranges) {
             DownloadMemory(device_addr, size);
@@ -360,7 +357,6 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         boost::container::small_vector<Download, 16> staged;
         boost::container::small_vector<Download, 16> mapped;
         u64 total_size_bytes = 0;
-        u64 mapped_tick = 0;
         for (const auto& [device_addr, size] : ranges) {
             ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
                 const DAddr buffer_addr = buffer.CpuAddr();
@@ -384,10 +380,6 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                                 };
                                 if (is_mapped) {
                                     mapped.push_back({buffer_id, copy});
-                                    if constexpr (has_mapped) {
-                                        mapped_tick =
-                                            (std::max)(mapped_tick, buffer.LastUsageTick());
-                                    }
                                     return;
                                 }
                                 staged.push_back({buffer_id, copy});
@@ -403,7 +395,7 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         }
         if (staged.empty()) {
             if constexpr (has_mapped) {
-                runtime.Wait(mapped_tick);
+                runtime.FinishForHostRead();
             }
         } else {
             auto staging = runtime.DownloadStagingBuffer(total_size_bytes);
@@ -413,7 +405,11 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                 buffer.MarkUsage(download.copy.src_offset, download.copy.size);
                 runtime.CopyBuffer(staging.buffer, buffer, std::span{&download.copy, 1}, true);
             }
-            runtime.Finish();
+            if constexpr (has_mapped) {
+                runtime.FinishForHostRead();
+            } else {
+                runtime.Finish();
+            }
             for (const Download& download : staged) {
                 device_memory.WriteBlockUnsafe(
                     slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
@@ -2747,7 +2743,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
-            runtime.Wait(buffer.LastUsageTick());
+            runtime.FinishForHostRead();
             for (const BufferCopy& copy : copies) {
                 device_memory.WriteBlockUnsafe(buffer.CpuAddr() + copy.src_offset,
                                                mapped.data() + copy.src_offset, copy.size);

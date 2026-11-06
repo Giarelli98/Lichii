@@ -156,6 +156,35 @@ TEST_CASE("Compatible v52 pipelines migrate without changing or discarding the o
     REQUIRE_FALSE(std::filesystem::exists(other));
 }
 
+TEST_CASE("Compatible pipeline cache migration retries after an interrupted temporary copy",
+          "[pipeline_cache_files][mesh_serialization][migration_retry]") {
+    TempDir temp;
+    const auto old = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 52);
+    const auto current = VideoCommon::VersionedPipelineCachePath(
+        temp.path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
+    auto temporary = current;
+    temporary += ".migrating";
+    WriteCache(old, Magic, 52, "complete pipeline records");
+    const auto before = ReadAll(old);
+    {
+        std::ofstream stream(temporary, std::ios::binary);
+        stream.write(before.data(), 4);
+    }
+    REQUIRE(ReadAll(temporary) == before.substr(0, 4));
+    REQUIRE(VideoCommon::CopyCompatiblePipelineCache(old, current, Magic, 52,
+                                                     VideoCommon::VulkanPipelineCacheVersion));
+    REQUIRE(ReadAll(old) == before);
+    REQUIRE(VideoCommon::PipelineCacheHeaderMatches(
+        current, Magic, VideoCommon::VulkanPipelineCacheVersion));
+    REQUIRE(ReadAll(current).substr(12) == before.substr(12));
+    REQUIRE_FALSE(std::filesystem::exists(temporary));
+    const auto migrated = ReadAll(current);
+    REQUIRE_FALSE(VideoCommon::CopyCompatiblePipelineCache(
+        old, current, Magic, 52, VideoCommon::VulkanPipelineCacheVersion));
+    REQUIRE(ReadAll(current) == migrated);
+    REQUIRE(ReadAll(old) == before);
+}
+
 TEST_CASE("Truncated mesh state is rejected before a pipeline can be queued",
           "[pipeline_cache_files][mesh_serialization]") {
     TempDir temp;

@@ -69,7 +69,8 @@ inline bool CopyCompatiblePipelineCache(const std::filesystem::path& source,
     }
     auto temporary = destination;
     temporary += ".migrating";
-    if (!std::filesystem::copy_file(source, temporary, error)) {
+    if (!std::filesystem::copy_file(source, temporary,
+                                    std::filesystem::copy_options::overwrite_existing, error)) {
         return false;
     }
     {
