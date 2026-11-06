@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstring>
 #ifdef _MSC_VER
 #include <intrin.h>
 #elif defined(ARCHITECTURE_x86_64)
@@ -114,6 +116,17 @@ struct ThreadData {
 };
 
 inline thread_local ThreadData t_data;
+
+/// Hitch report: the zone totals when Report last ran on this thread. A gap of 40 ms or more
+/// between two Report calls (one command, or one wait, that long) is logged with the zone or
+/// drain site that took most of it: what a stutter on this thread was.
+struct HitchSnapshot {
+    u64 now{};
+    u64 ticks{};
+    std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+    std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
+};
+inline thread_local HitchSnapshot t_hitch;
 
 class Scope {
 public:
@@ -235,6 +248,50 @@ inline void Report(const char* thread_name = "GPU thread") {
     }
     auto& data = t_data;
     const u64 now = Now();
+    if (auto& hitch = t_hitch; hitch.now != 0 && now - hitch.now >= 40'000'000ULL &&
+                               data.window_start != 0) {
+        const u64 ticks = Ticks();
+        const double ns_per_tick = static_cast<double>(now - hitch.now) /
+                                   static_cast<double>((std::max<u64>)(ticks - hitch.ticks, 1));
+        size_t zone = 0;
+        u64 zone_delta = 0;
+        for (size_t i = 1; i < data.exclusive_ns.size(); ++i) {
+            const u64 delta = data.exclusive_ns[i] - (std::min)(hitch.exclusive_ns[i], data.exclusive_ns[i]);
+            if (delta > zone_delta) {
+                zone_delta = delta;
+                zone = i;
+            }
+        }
+        size_t site = 0;
+        u64 site_delta = 0;
+        for (size_t i = 0; i < data.drain_ns.size(); ++i) {
+            const u64 delta = data.drain_ns[i] - (std::min)(hitch.drain_ns[i], data.drain_ns[i]);
+            if (delta > site_delta) {
+                site_delta = delta;
+                site = i;
+            }
+        }
+        // Waiting for work (the guest's next commands, or the front) is a stutter elsewhere:
+        // logged too, under its own limit.
+        const bool waiting = std::strcmp(zone_names[zone], "idle") == 0 ||
+                             std::strcmp(zone_names[zone], "split wait") == 0 ||
+                             std::strcmp(zone_names[zone], "pending sleep") == 0;
+        static std::atomic<u32> hitches{};
+        static std::atomic<u32> waiting_hitches{};
+        if ((waiting ? waiting_hitches : hitches).fetch_add(1, std::memory_order_relaxed) <
+            (waiting ? 150U : 400U)) {
+            LOG_INFO(HW_GPU, "{} hitch: {:.1f} ms in one step; most in zone {} ({:.1f} ms), "
+                     "longest wait for the back {} ({:.1f} ms)",
+                     thread_name, static_cast<double>(now - hitch.now) / 1e6, zone_names[zone],
+                     static_cast<double>(zone_delta) * ns_per_tick / 1e6,
+                     site_delta != 0 ? drain_site_names[site] : "none",
+                     static_cast<double>(site_delta) * ns_per_tick / 1e6);
+        }
+    }
+    t_hitch.now = now;
+    t_hitch.ticks = Ticks();
+    t_hitch.exclusive_ns = data.exclusive_ns;
+    t_hitch.drain_ns = data.drain_ns;
     if (data.window_start == 0) {
         data.window_start = now;
         data.window_start_ticks = Ticks();

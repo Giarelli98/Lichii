@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstddef>
 #include <fstream>
 #include <functional>
@@ -458,7 +459,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       emission_budget{num_pipeline_workers},
       workers(num_pipeline_workers, "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background),
-      background_pipelines{64, 16 * 1024 * 1024, device.HasBrokenParallelShaderCompiling()} {
+      background_pipelines{PrebuildCapacity(), PrebuildCapacity() * 512 * 1024,
+                           device.HasBrokenParallelShaderCompiling()} {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -715,6 +717,19 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
 // memory built before the game started; the list is only saved at exit or after two minutes, so a
 // boot that ran out of memory never saved one and the next boot did the same.
 constexpr size_t MaxPipelinesWithoutUsedList = 3000;
+
+// EDEN_NX2_PREBUILD=<count>: how many cached pipelines that recent sessions did not use are built
+// in the background after boot (default 64). The rest are built, their shaders translated on the
+// GPU thread, the first time a draw needs one: a stutter turning the camera onto something not
+// seen for a while (Ocarina of Time skipped ~980 at boot).
+size_t PrebuildCapacity() {
+    static const size_t capacity = [] {
+        const char* value = std::getenv("EDEN_NX2_PREBUILD");
+        const size_t parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+        return parsed != 0 ? (std::min<size_t>)(parsed, 8192) : size_t{64};
+    }();
+    return capacity;
+}
 
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
@@ -1122,8 +1137,27 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
         pipeline = background_pipelines.Take(graphics_key);
-        if (!pipeline) {
+        if (pipeline) {
+            ++runtime_prebuilt_hits;
+        } else {
+            const auto build_start = std::chrono::steady_clock::now();
             pipeline = CreateGraphicsPipeline();
+            const auto build_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - build_start)
+                                      .count();
+            ++runtime_builds;
+            runtime_build_us += static_cast<u64>(build_us);
+            if (build_us >= 4000 || (runtime_builds & 31) == 0) {
+                static u32 logged{};
+                if (logged++ < 300) {
+                    LOG_INFO(Render_Vulkan,
+                             "Runtime pipeline build #{}: {} us on the GPU thread ({}cached on "
+                             "disk); {} so far took {} ms, {} came from the background prebuild",
+                             runtime_builds, build_us,
+                             disk_pipelines.contains(graphics_key.Hash()) ? "" : "not ",
+                             runtime_builds, runtime_build_us / 1000, runtime_prebuilt_hits);
+                }
+            }
         }
     }
     if (!pipeline) {

@@ -221,6 +221,9 @@ private:
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
     PipelinePrebuild<GraphicsPipelineCacheKey, GraphicsPipeline> background_pipelines;
+    u64 runtime_builds{};       ///< Graphics pipelines a draw had to build (CurrentGraphicsPipelineSlowPath)
+    u64 runtime_build_us{};
+    u64 runtime_prebuilt_hits{}; ///< Of the new keys: taken from background_pipelines
 };
 
 } // namespace Vulkan
