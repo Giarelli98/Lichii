@@ -24,6 +24,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_release_track.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -244,6 +245,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
                                     ? VideoCommon::QueryPropertiesFlags::IsAFence
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
+        VideoCommon::Nx2ReleaseTrack::NoteRelease(dma_pusher.memory_manager.GetID(),
+                                                  sequence_address, payload);
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
@@ -269,7 +272,20 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
             return;
         }
+        namespace Track = VideoCommon::Nx2ReleaseTrack;
+        const auto track = op == GpuSemaphoreOperation::AcquireGequal &&
+                                   VideoCommon::GpuSplit::Get().Active()
+                               ? Track::Check(dma_pusher.memory_manager.GetID(), acquire.address,
+                                              acquire.value)
+                               : Track::Decision::Drain;
+        if (track == Track::Decision::Skip) {
+            return;
+        }
         DrainBack();
+        if (track == Track::Decision::Verify) {
+            Track::Verified(dma_pusher.memory_manager.GetID(), acquire.address, acquire.value,
+                            ReadSemaphoreWord(dma_pusher, acquire.address));
+        }
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
         }
@@ -322,6 +338,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
+    VideoCommon::Nx2ReleaseTrack::NoteRelease(dma_pusher.memory_manager.GetID(), sequence_address,
+                                              payload);
     OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
@@ -351,6 +369,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
     if (operation == 1) { // RELEASE
+        VideoCommon::Nx2ReleaseTrack::NoteRelease(dma_pusher.memory_manager.GetID(), address,
+                                                  payload);
         OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);

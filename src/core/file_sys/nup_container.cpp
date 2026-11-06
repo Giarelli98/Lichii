@@ -4,6 +4,8 @@
 #include "core/file_sys/nup_container.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <list>
@@ -149,6 +151,28 @@ bool Sha256(const u8* data, std::size_t size, std::array<u8, 0x20>& out) {
     return length == out.size();
 }
 
+// Decompressions of zstd members (game thread waits on each): logged when one takes 10 ms or
+// more, with totals, so an area-change stall shows how much of it is the container.
+struct NupDecompressStats {
+    std::atomic<u64> count{}, bytes{}, us{};
+};
+NupDecompressStats g_nup_stats;
+void NoteNupDecompress(const std::string& name, u64 bytes, bool spilled,
+                       std::chrono::steady_clock::time_point start) {
+    const u64 us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - start)
+                                        .count());
+    const u64 n = g_nup_stats.count.fetch_add(1) + 1;
+    const u64 total_bytes = g_nup_stats.bytes.fetch_add(bytes) + bytes;
+    const u64 total_us = g_nup_stats.us.fetch_add(us) + us;
+    if (us >= 10'000) {
+        LOG_INFO(Loader,
+                 "NUP decompressed {} ({} KiB{}) in {:.1f} ms; {} so far, {} MiB in {:.0f} ms",
+                 name, bytes >> 10, spilled ? ", to a temporary file" : "", us / 1000.0, n,
+                 total_bytes >> 20, total_us / 1000.0);
+    }
+}
+
 /// A member file whose extent is zstd-compressed. Decompresses on first read and caches the
 /// result (LRU-evicted); a file over half the cache cap is decompressed once to a temporary file.
 class NupVfsFile final : public VfsFile {
@@ -203,7 +227,9 @@ public:
         }
 
         // Miss: decompress without holding the lock, then publish and copy.
+        const auto start = std::chrono::steady_clock::now();
         std::vector<u8> scratch = Decompress();
+        NoteNupDecompress(name, uncompressed_size, false, start);
         if (scratch.empty()) {
             return 0;
         }
@@ -238,7 +264,9 @@ private:
         std::scoped_lock lock{spill->mutex};
         if (!spill->attempted) {
             spill->attempted = true;
+            const auto start = std::chrono::steady_clock::now();
             DecompressToFile(*spill);
+            NoteNupDecompress(name, uncompressed_size, true, start);
         }
         if (!spill->file.IsOpen() || !spill->file.Seek(static_cast<s64>(offset))) {
             return 0;

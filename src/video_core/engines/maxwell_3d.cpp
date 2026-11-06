@@ -32,6 +32,7 @@
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/nx2_release_track.h"
 #include "video_core/textures/texture.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -1201,6 +1202,20 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             // register, which a later Replay write reads back.
             fs.control = static_cast<Regs::ShadowRamControl>(argument);
             fs.shadow[method] = argument;
+            break;
+        case MAXWELL3D_REG_INDEX(report_semaphore.query):
+            if (VideoCommon::Nx2ReleaseTrack::Enabled()) {
+                Regs::ReportSemaphore sem{};
+                sem.address_high = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)];
+                sem.address_low = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
+                sem.query.raw = value;
+                if (sem.query.operation == Regs::ReportSemaphore::Operation::Release &&
+                    sem.query.report == Regs::ReportSemaphore::Report::Payload) {
+                    VideoCommon::Nx2ReleaseTrack::NoteRelease(
+                        memory_manager.GetID(), sem.Address(),
+                        fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)]);
+                }
+            }
             break;
         case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
             GetNativeMacroEngine().ClearCode(fs.regs[MAXWELL3D_REG_INDEX(load_mme.instruction_ptr)]);

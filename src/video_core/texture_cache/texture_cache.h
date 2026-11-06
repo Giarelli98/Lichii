@@ -33,6 +33,7 @@
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_upload_stats.h"
 #include "video_core/render_trace.h"
 #include "video_core/textures/decoders.h"
 
@@ -1717,6 +1718,14 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    namespace UploadStats = VideoCommon::Nx2UploadStats;
+    UploadStats::Timer upload_timer{VideoCommon::Nx2Profile::Enabled()};
+    upload_timer.bytes = image.guest_size_bytes;
+    upload_timer.format = static_cast<u32>(image.info.format);
+    upload_timer.width = image.info.size.width;
+    upload_timer.height = image.info.size.height;
+    upload_timer.levels = static_cast<u32>(image.info.resources.levels);
+    upload_timer.layers = static_cast<u32>(image.info.resources.layers);
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -1726,18 +1735,22 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     }
 
     if (True(image.flags & ImageFlagBits::SparseLayers)) {
+        upload_timer.path = UploadStats::Path::Sparse;
         RefreshSparseLayers(image);
         return;
     }
     if (True(image.flags & ImageFlagBits::SparseTiles)) {
+        upload_timer.path = UploadStats::Path::Sparse;
         RefreshSparseTiles(image);
         return;
     }
+    upload_timer.path = UploadStats::Path::Layers;
     if (!image.dirty_layers.empty() && UploadWrittenLayers(image)) {
         runtime.InsertUploadMemoryBarrier();
         return;
     }
     image.dirty_layers.clear();
+    upload_timer.path = UploadStats::Path::Other;
 
     if (True(image.flags & ImageFlagBits::Unbacked)) {
         // Nothing to upload into (and staging it could take tens of GB).
@@ -1751,6 +1764,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
+        upload_timer.path = UploadStats::Path::AsyncDecode;
         QueueAsyncDecode(image, image_id);
         return;
     }
@@ -1771,7 +1785,13 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+    upload_timer.path = UploadStats::Path::Chunked;
     if (!UploadInChunks(image)) {
+        upload_timer.path = True(image.flags & ImageFlagBits::AcceleratedUpload)
+                                ? UploadStats::Path::Accelerated
+                            : True(image.flags & ImageFlagBits::Converted)
+                                ? UploadStats::Path::Converted
+                                : UploadStats::Path::Plain;
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
