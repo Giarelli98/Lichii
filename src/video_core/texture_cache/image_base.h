@@ -127,6 +127,8 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
+    u64 nx2_upload_hash = 0;      ///< Hash of the guest bytes of the last upload (0: unknown)
+    u64 nx2_upload_tick = 0;      ///< modification_tick at that upload
     size_t lru_index = SIZE_MAX;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};

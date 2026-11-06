@@ -5,6 +5,8 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include <fmt/format.h>
@@ -25,11 +27,13 @@ enum class Path : u32 {
     Layers,      ///< Only written layers
     Sparse,      ///< Sparse layers or tiles
     Other,       ///< Unbacked, MSAA, async unswizzle
+    Deduplicated, ///< Skipped: same bytes as the last upload (EDEN_NX2_UPLOAD_DEDUP)
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(Path::Count)> names{
     "plain", "chunked", "converted", "accelerated", "async decode", "layers", "sparse", "other",
+    "deduplicated",
 };
 
 struct Totals {
@@ -68,7 +72,68 @@ inline void Note(Path path, u64 bytes, u64 us, u32 format, u32 width, u32 height
                             totals[i].us / 1000.0, totals[i].bytes >> 10);
         totals[i] = {};
     }
+    auto& dedup = GetDedupStats();
+    if (dedup.same != 0 || dedup.gpu_written_same != 0) {
+        line += fmt::format(" || same content as last upload {} ({} KiB), skipped {} ({} KiB), "
+                            "same but GPU-written since {}",
+                            dedup.same, dedup.same_bytes >> 10, dedup.skipped,
+                            dedup.skipped_bytes >> 10, dedup.gpu_written_same);
+        dedup = {};
+    }
     LOG_INFO(HW_GPU, "Texture uploads last 10 s:{}", line);
+}
+
+// EDEN_NX2_UPLOAD_DEDUP=1: an upload from guest memory whose bytes hash the same as the image's
+// last upload, with no GPU write to the image since (modification tick unchanged), is skipped:
+// the host copy already holds those bytes. Ocarina of Time re-sent ~360 MB/s of textures.
+inline bool DedupEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_UPLOAD_DEDUP");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+/// Fast 64-bit content hash (4 multiply-xor lanes, 32 bytes a step). Never returns 0.
+inline u64 Hash(const u8* data, size_t size) {
+    constexpr u64 k0 = 0x9E3779B97F4A7C15ULL, k1 = 0xC2B2AE3D27D4EB4FULL,
+                  k2 = 0x165667B19E3779F9ULL, k3 = 0xD6E8FEB86659FD93ULL;
+    u64 a = k0 ^ size, b = k1, c = k2, d = k3;
+    const auto mix = [](u64 h, u64 v, u64 k) {
+        h ^= v * k;
+        h = (h << 31) | (h >> 33);
+        return h * 0xFF51AFD7ED558CCDULL;
+    };
+    size_t i = 0;
+    for (; i + 32 <= size; i += 32) {
+        u64 w[4];
+        std::memcpy(w, data + i, 32);
+        a = mix(a, w[0], k1);
+        b = mix(b, w[1], k2);
+        c = mix(c, w[2], k3);
+        d = mix(d, w[3], k0);
+    }
+    for (; i + 8 <= size; i += 8) {
+        u64 w;
+        std::memcpy(&w, data + i, 8);
+        a = mix(a, w, k1);
+    }
+    u64 tail = 0;
+    std::memcpy(&tail, data + i, size - i);
+    b = mix(b, tail, k2);
+    u64 h = a ^ (b * 3) ^ (c * 5) ^ (d * 7);
+    h ^= h >> 33;
+    h *= 0xC4CEB9FE1A85EC53ULL;
+    h ^= h >> 29;
+    return h | 1;
+}
+
+struct DedupStats {
+    u64 same{}, same_bytes{}, skipped{}, skipped_bytes{}, gpu_written_same{};
+};
+inline DedupStats& GetDedupStats() {
+    static DedupStats stats;
+    return stats;
 }
 
 class Timer {

@@ -1728,6 +1728,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     upload_timer.layers = static_cast<u32>(image.info.resources.layers);
 
     image.flags &= ~ImageFlagBits::CpuModified;
+    // Any upload but the whole-image one below leaves the host copy unlike the last hash.
+    const u64 previous_upload_hash = image.nx2_upload_hash;
+    const u64 previous_upload_tick = image.nx2_upload_tick;
+    image.nx2_upload_hash = 0;
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
@@ -1781,6 +1785,30 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
 
         QueueAsyncUnswizzle(image, image_id);
         return;
+    }
+    const bool hash_upload = UploadStats::DedupEnabled() || VideoCommon::Nx2Profile::Enabled();
+    if (hash_upload && False(image.flags & ImageFlagBits::Sparse)) {
+        Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> guest(
+            *gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+        const u64 hash = UploadStats::Hash(guest.data(), guest.size());
+        auto& dedup = UploadStats::GetDedupStats();
+        if (hash == previous_upload_hash) {
+            if (image.modification_tick != previous_upload_tick) {
+                ++dedup.gpu_written_same;
+            } else {
+                ++dedup.same;
+                dedup.same_bytes += image.guest_size_bytes;
+                if (UploadStats::DedupEnabled()) {
+                    ++dedup.skipped;
+                    dedup.skipped_bytes += image.guest_size_bytes;
+                    image.nx2_upload_hash = hash;
+                    upload_timer.path = UploadStats::Path::Deduplicated;
+                    return;
+                }
+            }
+        }
+        image.nx2_upload_hash = hash;
+        image.nx2_upload_tick = image.modification_tick;
     }
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
