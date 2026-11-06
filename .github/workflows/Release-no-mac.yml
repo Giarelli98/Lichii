@@ -6,7 +6,7 @@ on:
       publish_release:
         description: Publish the binaries as a GitHub release
         type: boolean
-        default: true
+        default: false
   push:
     branches:
       - nx2-experimental
@@ -75,23 +75,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-          # Linux PGO builds use clang and Eglantine's profile.
-          - platform: linux-x86_64-pgo
-            runner: ubuntu-24.04
-            pgo: true
-          - platform: windows-x86_64
-            runner: windows-2022
+          # perf/dma-learn (Giarelli98 fork): only the Windows PGO binary. Never merge this.
           - platform: windows-x86_64-pgo
             runner: windows-2022
             pgo: true
             mingw: true
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - platform: linux-aarch64-pgo
-            runner: ubuntu-24.04-arm
-            pgo: true
 
     steps:
       - name: Check out source

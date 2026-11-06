@@ -62,6 +62,7 @@ enum class Zone : u32 {
     WriterWait,
     ListSubmitWait,
     ListGpuWait,
+    DeferredCall, ///< Split GPU thread: functions the front queued for the back (Kind::Call)
     Count,
 };
 
@@ -73,7 +74,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait",
-    "writer wait", "list submit wait", "list GPU wait",
+    "writer wait", "list submit wait", "list GPU wait", "deferred call",
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
