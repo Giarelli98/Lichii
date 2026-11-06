@@ -62,6 +62,15 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+// EDEN_NX2_ACQUIRE_PEEK=1: a semaphore AcquireGequal that guest memory already meets does not
+// wait for the back first. NVN's semaphores count up, so a value at or past the target is a
+// release that happened; work still queued on the back is earlier in this channel and stays in
+// order. Ocarina of Time checks ~3,000 acquires a second, nearly all already met.
+const bool g_acquire_peek = [] {
+    const char* v = std::getenv("EDEN_NX2_ACQUIRE_PEEK");
+    return v && v[0] == '1';
+}();
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -255,6 +264,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (g_acquire_peek && op == GpuSemaphoreOperation::AcquireGequal &&
+            VideoCommon::GpuSplit::Get().Active() &&
+            acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;

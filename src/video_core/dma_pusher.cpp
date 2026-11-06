@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "common/scope_exit.h"
@@ -30,6 +31,43 @@
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
+
+namespace {
+// EDEN_NX2_LIST_LEARN=1: a GP entry whose pages were checked often enough and never held
+// GPU-written commands does not wait for the back's queued compute and copy work first
+// (GpuSplit::WaitForWriters, ~5,000 waits a second in Ocarina of Time). A page that ever holds
+// GPU-written commands waits from then on, and every 64th entry of a page still waits and checks.
+struct ListLearnPage {
+    u32 seen{};
+    bool sticky{};
+};
+const bool g_list_learn = [] {
+    const char* v = std::getenv("EDEN_NX2_LIST_LEARN");
+    return v && v[0] == '1';
+}();
+std::unordered_map<u64, ListLearnPage> g_list_learn_pages;
+
+/// Whether the entry's pages are learned to hold only CPU-written commands; counts the visit.
+bool ListLearnedClean(GPUVAddr address, u64 bytes) {
+    bool clean = true;
+    const GPUVAddr end = address + (std::max<u64>)(bytes, 1);
+    for (GPUVAddr page = address >> 12; page <= (end - 1) >> 12; ++page) {
+        ListLearnPage& learn = g_list_learn_pages[page];
+        const u32 n = learn.seen++;
+        if (learn.sticky || n < 32 || (n & 63) == 0) {
+            clean = false;
+        }
+    }
+    return clean;
+}
+
+void ListLearnMarkWritten(GPUVAddr address, u64 bytes) {
+    const GPUVAddr end = address + (std::max<u64>)(bytes, 1);
+    for (GPUVAddr page = address >> 12; page <= (end - 1) >> 12; ++page) {
+        g_list_learn_pages[page].sticky = true;
+    }
+}
+} // Anonymous namespace
 
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
@@ -198,10 +236,15 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
-            gpu_written =
-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
+            const u64 entry_bytes = u64{header.size} * sizeof(u32);
+            const bool learned = g_list_learn && ListLearnedClean(dma_state.dma_get, entry_bytes);
+            if (!learned && VideoCommon::GpuSplit::Get().WaitForWriters()) {
+                gpu_written = IsGpuWrittenCommands(dma_state.dma_get, size_t{entry_bytes});
+            }
+        }
+        if (gpu_written && g_list_learn) {
+            ListLearnMarkWritten(dma_state.dma_get, u64{header.size} * sizeof(u32));
         }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
         const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
