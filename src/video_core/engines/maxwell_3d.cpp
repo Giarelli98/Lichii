@@ -1426,6 +1426,13 @@ const bool g_dma_learn = [] {
 }();
 std::unordered_map<u64, DmaLearnPage> g_dma_learn_pages;
 u32 g_dma_learn_skips{};
+// EDEN_NX2_DMA_PENDING / EDEN_NX2_DMA_SKIPS: run-ahead bounds of DMA_LEARN (defaults 4096 / 16).
+u64 EnvU64(const char* name, u64 fallback) {
+    const char* v = std::getenv(name);
+    return (v && v[0]) ? std::strtoull(v, nullptr, 10) : fallback;
+}
+const u64 g_dma_max_pending = EnvU64("EDEN_NX2_DMA_PENDING", 1u << 12);
+const u32 g_dma_max_skips = static_cast<u32>(EnvU64("EDEN_NX2_DMA_SKIPS", 16));
 } // namespace
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
@@ -1452,9 +1459,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         // Bounded run-ahead: a skipped drain lets the front get ahead of the back; past this
         // backlog (or this many skips in a row) the drain is taken, so a later one never meets
         // a deep queue (that was the 1% lows of EDEN_NX2_DMA_LEARN).
-        constexpr u64 MaxPendingWords = 1u << 12;
-        constexpr u32 MaxSkipsInRow = 16;
-        const bool bounded = split.Pending() < MaxPendingWords && g_dma_learn_skips < MaxSkipsInRow;
+        const bool bounded =
+            split.Pending() < g_dma_max_pending && g_dma_learn_skips < g_dma_max_skips;
         skip_drain = !learn_page->sticky && !verify && bounded;
         g_dma_learn_skips = skip_drain ? g_dma_learn_skips + 1 : 0;
         if (!skip_drain && !learn_page->sticky) {
