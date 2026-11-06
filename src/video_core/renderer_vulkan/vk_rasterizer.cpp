@@ -1779,7 +1779,14 @@ void RasterizerVulkan::WaitForIdle() {
 
     query_cache.NotifyWFI();
 
-    if (device.IsMoltenVK() && scheduler.IsRenderPassActive()) {
+    // EDEN_NX2_WFI_DEFER=1: like MoltenVK and FragmentBarrier, an idle wait inside a render pass
+    // is deferred, so the pass only ends if the next draw reads what this one wrote. Ocarina ends
+    // ~980 passes a second here (Kokiri Forest).
+    static const bool wfi_defer = [] {
+        const char* value = std::getenv("EDEN_NX2_WFI_DEFER");
+        return value && value[0] == '1';
+    }();
+    if ((device.IsMoltenVK() || wfi_defer) && scheduler.IsRenderPassActive()) {
         scheduler.DeferFragmentBarrier();
         fence_manager.SignalOrdering();
         return;
