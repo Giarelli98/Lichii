@@ -1797,8 +1797,18 @@ void PipelineCache::EvictUnusedPipelines() {
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    // EDEN_NX2_EVICT_FRAMES=<frames> (0: never; EDEN_NX2_AGGRESSIVE: never): how long a
+    // pipeline may sit unused. 9000 (2.5 minutes at 60 fps) made going back to a place build
+    // all of its pipelines again; 32 GB hosts can keep them.
+    static const u64 EvictAfterFrames = [] {
+        const char* v = std::getenv("EDEN_NX2_EVICT_FRAMES");
+        if (v && v[0]) {
+            return static_cast<u64>(std::strtoull(v, nullptr, 10));
+        }
+        const char* aggressive = std::getenv("EDEN_NX2_AGGRESSIVE");
+        return (aggressive && aggressive[0] == '1') ? u64{0} : u64{9000};
+    }();
+    if (EvictAfterFrames == 0 || frame_count <= EvictAfterFrames) {
         return;
     }
     // Only while the cache is large: each one evicted is translated again on the GPU thread when
