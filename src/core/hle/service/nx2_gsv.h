@@ -2610,6 +2610,17 @@ private:
     u64 m_decode_us{};
     u64 m_write_us{};
     std::chrono::steady_clock::time_point m_window_start{};
+    // EDEN_NX2_VIDEO_REALTIME: wall time of pts 0 for the playing stream, set at its first submit.
+    std::optional<std::chrono::steady_clock::time_point> m_clock_base;
+    std::chrono::steady_clock::time_point m_last_out_wall{};
+    u64 m_dropped{};
+    static bool VideoRealtime() {
+        static const bool enabled = [] {
+            const char* v = std::getenv("EDEN_NX2_VIDEO_REALTIME");
+            return v && v[0] == '1';
+        }();
+        return enabled;
+    }
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
 
     void Log(HLERequestContext& ctx, std::string_view what) {
@@ -2816,6 +2827,10 @@ private:
         const auto input_size = input.data.size();
         {
             std::scoped_lock lk{m_mutex};
+            if (!m_clock_base) {
+                m_clock_base = std::chrono::steady_clock::now() - std::chrono::microseconds{pts};
+                m_last_out_wall = {};
+            }
             m_inputs.Push(std::move(input));
             m_stream_ended = false;
             m_end_queued |= end;
@@ -2851,6 +2866,7 @@ private:
                          m_stream_ended, m_end_queued);
             }
             m_inputs.Clear();
+            m_clock_base.reset();
             m_flush = true;
             m_stream_ended = false;
             m_end_queued = false;
@@ -2959,6 +2975,27 @@ private:
                 continue;
             }
             if (!m_decoded.empty() && !m_free.empty()) {
+                // EDEN_NX2_VIDEO_REALTIME=1: the game shows one movie frame per game frame, so a
+                // game under 60 fps plays the movie slow while its audio runs in real time. Drop
+                // frames that are more than 50 ms behind the movie clock (wall time since the
+                // first submit) when a later one is already there or queued.
+                if (VideoRealtime() && m_clock_base) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (m_last_out_wall.time_since_epoch().count() != 0 &&
+                        now - m_last_out_wall > std::chrono::seconds{1}) {
+                        // Paused or loading: the movie did not advance either.
+                        *m_clock_base += (now - m_last_out_wall) - std::chrono::milliseconds{17};
+                    }
+                    const Decoded& next = m_decoded.front();
+                    const auto due = *m_clock_base + std::chrono::microseconds{next.pts};
+                    if (!next.end && next.picture && now - due > std::chrono::milliseconds{50} &&
+                        (m_decoded.size() > 1 || !m_inputs.Empty())) {
+                        m_decoded.pop_front();
+                        ++m_dropped;
+                        m_last_out_wall = now;
+                        continue;
+                    }
+                }
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
                 const u32 image = m_free.front();
@@ -2980,7 +3017,9 @@ private:
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
+                m_last_out_wall = std::chrono::steady_clock::now();
                 if (frame.end) {
+                    m_clock_base.reset();
                     m_stream_ended = true;
                     m_end_queued = false;
                     m_ready->room.store(false, std::memory_order_relaxed);
@@ -3007,9 +3046,9 @@ private:
                             : std::chrono::duration<double, std::milli>(now - m_window_start).count();
                     LOG_INFO(Service,
                              "{} last 120 frames: decode {:.2f} ms, write {:.2f} ms a frame; "
-                             "{:.1f} fps out, pts {:.2f} s",
+                             "{:.1f} fps out, pts {:.2f} s, {} dropped so far",
                              GetServiceName(), m_decode_us / 120000.0, m_write_us / 120000.0,
-                             wall_ms > 0 ? 120000.0 / wall_ms : 0.0, frame.pts / 1e6);
+                             wall_ms > 0 ? 120000.0 / wall_ms : 0.0, frame.pts / 1e6, m_dropped);
                     m_decode_us = 0;
                     m_write_us = 0;
                     m_window_start = now;
