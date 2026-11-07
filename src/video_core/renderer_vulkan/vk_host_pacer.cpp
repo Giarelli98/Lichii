@@ -10,7 +10,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <dwmapi.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "dwmapi.lib")
+#endif
 #endif
 
 namespace Vulkan {

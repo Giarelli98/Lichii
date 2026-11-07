@@ -465,8 +465,9 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
         if (target <= start || target - start >= pacer.RefreshPeriod()) {
             return false;
         }
-        for (auto now = start; now < target && !token.stop_requested(); now = Clock::now()) {
-            const auto left = target - now;
+        for (auto hold_now = start; hold_now < target && !token.stop_requested();
+             hold_now = Clock::now()) {
+            const auto left = target - hold_now;
             if (left > std::chrono::microseconds{1500}) {
                 std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
             } else {
@@ -481,8 +482,9 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     if (target <= start) {
         return false;
     }
-    for (auto now = start; now < target && !token.stop_requested(); now = Clock::now()) {
-        const auto left = target - now;
+    for (auto hold_now = start; hold_now < target && !token.stop_requested();
+         hold_now = Clock::now()) {
+        const auto left = target - hold_now;
         if (left > std::chrono::microseconds{1500}) {
             std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
         } else {
