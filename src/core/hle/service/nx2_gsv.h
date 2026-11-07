@@ -2708,6 +2708,9 @@ private:
 
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
+    u64 m_decode_us{};
+    u64 m_write_us{};
+    std::chrono::steady_clock::time_point m_window_start{};
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
 
     void Log(HLERequestContext& ctx, std::string_view what) {
@@ -3070,7 +3073,11 @@ private:
                 if (fence) {
                     WaitForRelease(*fence);
                 }
+                const auto write_start = std::chrono::steady_clock::now();
                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
+                m_write_us += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                   std::chrono::steady_clock::now() - write_start)
+                                                   .count());
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
@@ -3090,6 +3097,23 @@ private:
                     LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
                              GetServiceName(), m_frames_out, width, height, frame.pts,
                              frame.end ? ", end of stream" : "", image);
+                }
+                // Every 120 frames: per-frame cost on this thread, to see whether decoding keeps
+                // up with the movie's rate (60 fps needs under 16.7 ms a frame).
+                if (m_frames_out % 120 == 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const double wall_ms =
+                        m_window_start.time_since_epoch().count() == 0
+                            ? 0.0
+                            : std::chrono::duration<double, std::milli>(now - m_window_start).count();
+                    LOG_INFO(Service,
+                             "{} last 120 frames: decode {:.2f} ms, write {:.2f} ms a frame; "
+                             "{:.1f} fps out, pts {:.2f} s",
+                             GetServiceName(), m_decode_us / 120000.0, m_write_us / 120000.0,
+                             wall_ms > 0 ? 120000.0 / wall_ms : 0.0, frame.pts / 1e6);
+                    m_decode_us = 0;
+                    m_write_us = 0;
+                    m_window_start = now;
                 }
                 continue;
             }
@@ -3117,10 +3141,14 @@ private:
                 decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
             }
             pictures.clear();
+            const auto decode_start = std::chrono::steady_clock::now();
             decoder->Decode(input.data, input.pts, pictures);
             if (input.end) {
                 decoder->Drain(pictures);
             }
+            m_decode_us += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                std::chrono::steady_clock::now() - decode_start)
+                                                .count());
             lk.lock();
             m_decoded_frames += pictures.size();
             if (Nx2VideoTraceEnabled()) {
@@ -3255,8 +3283,34 @@ private:
                             layout.pitch, 0, bytes);
             DumpFrame(image_id, bytes, layout, width, height);
             m_tiled.resize(layout.size);
-            Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
-                                           layout.height, 1, 4, 0, 1, true);
+            // EDEN_NX2_VIDEO_THREADS: tile in bands of whole 16-GOB block rows (128 lines) at
+            // once; a block row of a pitch-aligned image starts at line * pitch in both layouts.
+            const u32 tile_threads = Tegra::Host1x::Nx2VideoThreads();
+            const u64 block_rows = (u64{layout.height} + 127) / 128;
+            if (tile_threads > 1 && layout.pitch % 64 == 0 && block_rows >= tile_threads &&
+                m_tiled.size() >= block_rows * 128 * layout.pitch &&
+                bytes.size() >= block_rows * 128 * layout.pitch) {
+                const u64 rows_per_band = ((block_rows + tile_threads - 1) / tile_threads) * 128;
+                std::vector<std::thread> workers;
+                for (u64 y0 = 0; y0 < layout.height; y0 += rows_per_band) {
+                    const u32 rows = static_cast<u32>(std::min<u64>(rows_per_band, layout.height - y0));
+                    const u64 offset = y0 * layout.pitch;
+                    const u64 band_bytes = ((u64{rows} + 127) / 128) * 128 * layout.pitch;
+                    workers.emplace_back([this, &bytes, &layout, offset, band_bytes, rows] {
+                        Tegra::Texture::SwizzleTexture(
+                            std::span<u8>{m_tiled}.subspan(offset, band_bytes),
+                            std::span<const u8>{bytes}.subspan(offset, band_bytes), 4,
+                            static_cast<u32>(layout.pitch / 4), rows, 1, 4, 0, 1, true);
+                    });
+                }
+                for (auto& worker : workers) {
+                    worker.join();
+                }
+            } else {
+                Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4,
+                                               static_cast<u32>(layout.pitch / 4),
+                                               layout.height, 1, 4, 0, 1, true);
+            }
             memory.WriteBlock(address, m_tiled.data(), m_tiled.size());
             if (const auto device =
                     Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
