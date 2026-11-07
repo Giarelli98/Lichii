@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -140,6 +141,12 @@ public:
         u64* const entry = Reserve(2 + payload);
         entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
+        if (profile_thunks) [[unlikely]] {
+            static const bool named = (NameThunk(reinterpret_cast<u64>(&CallThunk<Func>),
+                                                 ThunkName<Func>()),
+                                       true);
+            (void)named;
+        }
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
     }
@@ -208,6 +215,21 @@ private:
     static constexpr size_t PublishEvery = 256;
 
     template <typename Func>
+    /// The deferred lambda's type as the compiler spells it: clang gives its file and line.
+    template <typename Func>
+    static const char* ThunkName() {
+#if defined(_MSC_VER) && !defined(__clang__)
+        return __FUNCSIG__;
+#else
+        return __PRETTY_FUNCTION__;
+#endif
+    }
+    static inline const bool profile_thunks = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+    /// With EDEN_NX2_GPU_PROFILE: names a deferred call's thunk for the per-site report.
+    static void NameThunk(u64 thunk, const char* name);
+    /// Back thread, with the profile: time one deferred call by its thunk.
+    static void NoteThunk(u64 thunk, u64 ns);
+
     static void CallThunk(const u64* payload) {
         (*reinterpret_cast<const Func*>(payload))();
     }

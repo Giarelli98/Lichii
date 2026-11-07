@@ -250,6 +250,9 @@ struct GPU::Impl {
         gpu_thread.FlushRegion(addr, size, is_async);
     }
 
+    std::atomic<u64> readback_queue_us{};
+    std::atomic<u64> readback_flush_us{};
+
     u32 ReadbackKinds(const VideoCore::RasterizerDownloadArea& area) {
         if (!VideoCommon::Nx2Profile::Enabled()) {
             return 0;
@@ -308,8 +311,11 @@ struct GPU::Impl {
             total_reads += st.reads;
             total_us += st.wait_us;
         }
-        LOG_INFO(HW_GPU, "CPU readbacks last 10 s: {} reads, {:.0f} ms waited, {} areas", total_reads,
-                 total_us / 1000.0, sorted.size());
+        LOG_INFO(HW_GPU,
+                 "CPU readbacks last 10 s: {} reads, {:.0f} ms waited, {} areas; of the wait "
+                 "{:.0f} ms before the GPU thread reached the read, {:.0f} ms flushing",
+                 total_reads, total_us / 1000.0, sorted.size(),
+                 readback_queue_us.exchange(0) / 1000.0, readback_flush_us.exchange(0) / 1000.0);
         for (size_t i = 0; i < std::min<size_t>(10, sorted.size()); ++i) {
             const auto& [start, st] = sorted[i];
             LOG_INFO(HW_GPU,
@@ -415,11 +421,29 @@ struct GPU::Impl {
                 }
             }
         }
-        const u64 fence = RequestSyncOperation([this, raster_area, batch = std::move(batch)]() {
+        const auto request_time = std::chrono::steady_clock::now();
+        const u64 fence = RequestSyncOperation([this, raster_area, request_time,
+                                                batch = std::move(batch)]() {
+            // With the profile: how long the read waited before the GPU thread reached it
+            // (queued work ahead of it), and how long the flush itself took (GPU and download).
+            const auto run_start = std::chrono::steady_clock::now();
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();
             auto* rasterizer = renderer->ReadRasterizer();
             rasterizer->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
+            if (VideoCommon::Nx2Profile::Enabled()) {
+                const auto run_end = std::chrono::steady_clock::now();
+                readback_queue_us.fetch_add(
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         run_start - request_time)
+                                         .count()),
+                    std::memory_order_relaxed);
+                readback_flush_us.fetch_add(
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         run_end - run_start)
+                                         .count()),
+                    std::memory_order_relaxed);
+            }
             for (const DAddr batch_page : batch) {
                 if (rasterizer->MustFlushRegion(batch_page, Core::DEVICE_PAGESIZE,
                                                 VideoCommon::CacheType::BufferCache)) {

@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 
@@ -408,11 +412,69 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     case Kind::Call: {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         Nx2Profile::Scope call_scope{Nx2Profile::Zone::DeferredCall};
-        reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
+        if (Nx2Profile::Enabled()) [[unlikely]] {
+            const auto start = std::chrono::steady_clock::now();
+            reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
+            NoteThunk(entry[1], static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - start)
+                                                     .count()));
+        } else {
+            reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
+        }
         return 2 + payload;
     }
     }
     return 1;
+}
+
+namespace {
+std::mutex g_thunk_names_mutex;
+std::unordered_map<u64, std::string> g_thunk_names;
+struct ThunkStat {
+    u64 calls{};
+    u64 ns{};
+};
+std::unordered_map<u64, ThunkStat> g_thunk_stats; // back thread only
+auto g_thunk_window = std::chrono::steady_clock::now();
+} // namespace
+
+void GpuSplit::NameThunk(u64 thunk, const char* name) {
+    std::string text{name};
+    // Keep the lambda's "(lambda at file:line:col)" part when the compiler gives one.
+    if (const auto at = text.find("(lambda at "); at != std::string::npos) {
+        const auto end = text.find(')', at);
+        text = text.substr(at + 11, end == std::string::npos ? std::string::npos : end - at - 11);
+        if (const auto src = text.find("src"); src != std::string::npos) {
+            text = text.substr(src);
+        }
+    } else if (text.size() > 160) {
+        text = text.substr(text.size() - 160);
+    }
+    std::scoped_lock lock{g_thunk_names_mutex};
+    g_thunk_names.emplace(thunk, std::move(text));
+}
+
+void GpuSplit::NoteThunk(u64 thunk, u64 ns) {
+    ThunkStat& stat = g_thunk_stats[thunk];
+    ++stat.calls;
+    stat.ns += ns;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_thunk_window < std::chrono::seconds{10}) {
+        return;
+    }
+    g_thunk_window = now;
+    std::vector<std::pair<u64, ThunkStat>> sorted(g_thunk_stats.begin(), g_thunk_stats.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    std::scoped_lock lock{g_thunk_names_mutex};
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 12); ++i) {
+        const auto& [ptr, st] = sorted[i];
+        const auto name = g_thunk_names.find(ptr);
+        LOG_INFO(HW_GPU, "Deferred calls last 10 s #{}: {:.1f} ms in {} calls ({:.2f} us each) at {}",
+                 i + 1, st.ns / 1e6, st.calls, st.calls ? st.ns / 1e3 / st.calls : 0.0,
+                 name != g_thunk_names.end() ? name->second : std::string{"?"});
+    }
+    g_thunk_stats.clear();
 }
 
 void GpuSplit::BackLoop(std::stop_token stop_token) {
