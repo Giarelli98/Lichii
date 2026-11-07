@@ -364,9 +364,9 @@ struct GPU::Impl {
             if (hot_pages.size() > 4096) {
                 hot_pages.clear();
             }
-            for (const auto& [page, n] : hot_pages) {
-                if (n >= 8 && page != raster_area.start_address && batch.size() < 32) {
-                    batch.push_back(page);
+            for (const auto& [hot_page, n] : hot_pages) {
+                if (n >= 8 && hot_page != raster_area.start_address && batch.size() < 32) {
+                    batch.push_back(hot_page);
                 }
             }
         }
@@ -375,10 +375,10 @@ struct GPU::Impl {
             InvalidateGPUCache();
             auto* rasterizer = renderer->ReadRasterizer();
             rasterizer->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
-            for (const DAddr page : batch) {
-                if (rasterizer->MustFlushRegion(page, Core::DEVICE_PAGESIZE,
+            for (const DAddr batch_page : batch) {
+                if (rasterizer->MustFlushRegion(batch_page, Core::DEVICE_PAGESIZE,
                                                 VideoCommon::CacheType::BufferCache)) {
-                    rasterizer->FlushRegion(page, Core::DEVICE_PAGESIZE,
+                    rasterizer->FlushRegion(batch_page, Core::DEVICE_PAGESIZE,
                                             VideoCommon::CacheType::BufferCache);
                 }
             }
