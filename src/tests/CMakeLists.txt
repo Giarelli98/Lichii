@@ -16,6 +16,7 @@ add_executable(tests
     core/nx2_video_ready.cpp
     core/nx2_debug_server.cpp
     core/nx2_present_pacer.cpp
+    video_core/host_pacer.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
     audio_core/nx2_sysmix.cpp
@@ -74,6 +75,7 @@ add_executable(tests
     video_core/gpu_written_pages.cpp
     video_core/command_writer.cpp
     video_core/split_fence_wait.cpp
+    video_core/semaphore_acquire.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp

@@ -52,6 +52,22 @@ public:
         return {*last_deadline, reset};
     }
 
+    /// Moves the current deadline (and the ones after it) by `shift`.
+    void Shift(std::chrono::nanoseconds shift) {
+        if (last_deadline) {
+            *last_deadline += shift;
+        }
+    }
+
+    static std::chrono::nanoseconds PhaseShift(double error_ns, std::chrono::nanoseconds slack) {
+        if (slack < std::chrono::milliseconds{2}) {
+            return std::chrono::nanoseconds::zero();
+        }
+        const double latest = (std::min)(500'000.0, static_cast<double>(slack.count()) - 2e6);
+        return std::chrono::nanoseconds{
+            static_cast<std::chrono::nanoseconds::rep>(std::clamp(error_ns * 0.2, -500'000.0, latest))};
+    }
+
 private:
     std::optional<Clock::time_point> last_deadline;
 };

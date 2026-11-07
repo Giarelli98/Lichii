@@ -425,6 +425,10 @@ def call_once(adapter, request_text, out, stdout):
     """--call: one request, its JSON result on stdout, its PNG (if any) saved to `out`."""
     try:
         request = json.loads(request_text)
+        if request["method"] == "switch":
+            result = adapter.emulator.call("switch", request.get("params") or {}, 5)
+            stdout.write(json.dumps(result, indent=1) + "\n")
+            return 0
         result, png = adapter.run(request["method"], request.get("params") or {})
     except (EmulatorError, KeyError, ValueError, TypeError, AttributeError) as error:
         message = f"missing {error} in the request" if isinstance(error, KeyError) else str(error)

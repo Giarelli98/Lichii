@@ -26,6 +26,7 @@
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -185,13 +186,8 @@ bool Scheduler::DeferFlush() {
     // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
     // Command list copies after dispatches were ~9,000 more a second, of which the front waited
     // for about 5%.
-    static const s64 interval_us = [] {
-        const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
-        if (value != nullptr) {
-            return static_cast<s64>(std::atoll(value));
-        }
-        return s64{500};
-    }();
+    const s64 interval_us = std::clamp(VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_fence_flush_us, "EDEN_NX2_FENCE_FLUSH_US", 500), 0, 5000);
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
         return false;

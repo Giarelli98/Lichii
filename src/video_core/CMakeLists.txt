@@ -214,6 +214,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
+    renderer_vulkan/vk_host_pacer.cpp
+    renderer_vulkan/vk_host_pacer.h
     renderer_vulkan/vk_query_cache.cpp
     renderer_vulkan/vk_query_cache.h
     renderer_vulkan/vk_rasterizer.cpp
@@ -556,7 +558,7 @@ if (ENABLE_NVIDIA_DLSS)
         vulkan_common/streamline_api.h
     )
     target_include_directories(video_core PRIVATE "${STREAMLINE_INCLUDE_DIR}")
-    target_link_libraries(video_core PRIVATE version wintrust crypt32)
+    target_link_libraries(video_core PRIVATE version wintrust crypt32 dwmapi)
     target_compile_definitions(video_core PUBLIC EGLANTINE_STREAMLINE)
     message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
 endif()
