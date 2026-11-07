@@ -2986,8 +2986,15 @@ private:
                         // Paused or loading: the movie did not advance either.
                         *m_clock_base += (now - m_last_out_wall) - std::chrono::milliseconds{17};
                     }
+                    // EDEN_NX2_VIDEO_LEAD_MS (default 150): how far ahead of the audio a frame is
+                    // handed out, for the images the game queues before it shows one.
+                    static const auto lead = std::chrono::milliseconds{[] {
+                        const char* v = std::getenv("EDEN_NX2_VIDEO_LEAD_MS");
+                        return v && v[0] ? std::strtol(v, nullptr, 10) : 150L;
+                    }()};
                     const Decoded& next = m_decoded.front();
-                    const auto due = *m_clock_base + std::chrono::microseconds{next.pts};
+                    const auto due =
+                        *m_clock_base + std::chrono::microseconds{next.pts} - lead;
                     if (!next.end && next.picture && now - due > std::chrono::milliseconds{50} &&
                         (m_decoded.size() > 1 || !m_inputs.Empty())) {
                         m_decoded.pop_front();
