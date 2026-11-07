@@ -364,8 +364,8 @@ struct GPU::Impl {
             if (hot_pages.size() > 4096) {
                 hot_pages.clear();
             }
-            for (const auto& [hot_page, n] : hot_pages) {
-                if (n >= 8 && hot_page != raster_area.start_address && batch.size() < 32) {
+            for (const auto& [hot_page, hot_reads] : hot_pages) {
+                if (hot_reads >= 8 && hot_page != raster_area.start_address && batch.size() < 32) {
                     batch.push_back(hot_page);
                 }
             }
