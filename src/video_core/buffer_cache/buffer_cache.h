@@ -21,7 +21,6 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
-#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -211,14 +210,9 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // structures next to the draw arguments its compute dispatches fill in; the draws then read
     // leftover bytes as vertex counts. Download those bytes first (the CPU's own were subtracted
     // above, so they aren't overwritten).
-    // Only the scheduler's owner may download (it records and submits): unmaps and other writes
-    // reach this from CPU and service threads too, and submitting there raced the GPU thread's
-    // own submissions (crashes in Scheduler::SubmitExecution). Those keep the old behaviour;
-    // guest CPU writes come through TryCacheInvalidation, which sends such pages to the GPU thread.
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data && VideoCommon::GpuSplit::OwnsScheduler() &&
-        gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+    if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
         // Switch 2 titles: upload the CPU's bytes into the buffer instead, as CachedWriteMemory
         // does, so the page stays GPU-owned and nothing waits for the host GPU.
         static const int forced = [] {
@@ -748,9 +742,9 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     }
     channel_state->storage_buffers[stage][ssbo_index] =
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
-                             StorageBindingPolicy::Graphics(
-                                 maxwell3d->GetNativeMacroEngine().native_turing,
-                                 indirect_offset != ~0U));
+                             maxwell3d->GetNativeMacroEngine().native_turing ||
+                                 indirect_offset != ~0U,
+                             indirect_offset != ~0U);
     if (indirect_offset != ~0U) {
         TraceTablePointer(false, stage, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
                           channel_state->storage_buffers[stage][ssbo_index]);
@@ -842,9 +836,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         ssbo_addr = holder + indirect_offset;
     }
     channel_state->compute_storage_buffers[ssbo_index] = StorageBufferBinding(
-        ssbo_addr, cbuf_index, is_written,
-        StorageBindingPolicy::Compute(kepler_compute->IsNativeMode(),
-                                      kepler_compute->IsDlssDispatch(), indirect_offset != ~0U));
+        ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode(), indirect_offset != ~0U);
     if (indirect_offset != ~0U) {
         TraceTablePointer(true, 0, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
                           channel_state->compute_storage_buffers[ssbo_index]);
@@ -2945,12 +2937,12 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
 
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
-                                             StorageBindingPolicy policy) const {
-                                                 const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+                                             bool native_pointer, bool table_pointer) const {
+    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
-                                                 if (gpu_addr == 0) {
-                                                     return NULL_BINDING;
-                                                 }
+    if (gpu_addr == 0) {
+        return NULL_BINDING;
+    }
 
     const bool reads_size_word = !(table_pointer && !is_written) && !native_pointer;
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
@@ -3017,78 +3009,37 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
         }
 
-                                                 struct CachedBinding {
-                                                     size_t owner{};
-                                                     GPUVAddr gpu_addr{};
-                                                     u64 next_qword{};
-                                                     u64 serial{};
-                                                     u32 alignment{};
-                                                     u32 flags{};
-                                                     Binding binding{};
-                                                 };
+        // Alignment only applies to the offset of the buffer
+        const GPUVAddr aligned_gpu_addr = Common::AlignDown(gpu_addr, alignment);
+        const u32 aligned_size = static_cast<u32>(gpu_addr - aligned_gpu_addr) + size;
 
-                                                 constexpr size_t ways = 4;
-                                                 thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
+        const std::optional<DAddr> aligned_device_addr =
+            gpu_memory->GpuToCpuAddress(aligned_gpu_addr);
+        if (!aligned_device_addr || size == 0) {
+            LOG_DEBUG(HW_GPU, "Failed to find storage buffer for cbuf index {}", cbuf_index);
+            return NULL_BINDING;
+        }
+        const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+        ASSERT_MSG(device_addr, "Unaligned storage buffer address not found for cbuf index {}",
+                   cbuf_index);
+        // The end address used for size calculation does not need to be aligned
+        const DAddr cpu_end = Common::AlignUp(*device_addr + size, Core::DEVICE_PAGESIZE);
 
-                                                 const u32 flags = (is_written ? 1U : 0U) | (policy.size_from_mapping ? 2U : 0U) |
-                                                 (policy.table_pointer ? 4U : 0U) |
-                                                 (policy.require_contiguous ? 8U : 0U);
-                                                 const size_t owner = gpu_memory->GetID() + 1;
-                                                 const u64 serial = gpu_memory->MapSerial();
-
-                                                 auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
-
-                                                 for (size_t way = 0; way < ways; ++way) {
-                                                     const CachedBinding& cached = set[way];
-                                                     if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
-                                                         cached.next_qword == next_qword && cached.serial == serial &&
-                                                         cached.alignment == alignment && cached.flags == flags && !Nx2Perf::Verify()) {
-                                                         const Binding hit = cached.binding;
-                                                     std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
-                                                     return hit;
-                                                         }
-                                                 }
-
-                                                 u32 size = policy.Size(memory_layout_size, next_qword, is_written);
-
-                                                 if (policy.require_contiguous && size != 0) {
-                                                     size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
-                                                 }
-
-                                                 const GPUVAddr aligned_gpu_addr = Common::AlignDown(gpu_addr, alignment);
-                                                 const u32 aligned_size = static_cast<u32>(gpu_addr - aligned_gpu_addr) + size;
-
-                                                 const std::optional<DAddr> aligned_device_addr =
-                                                 gpu_memory->GpuToCpuAddress(aligned_gpu_addr);
-
-                                                 if (!aligned_device_addr || size == 0) {
-                                                     LOG_DEBUG(HW_GPU, "Failed to find storage buffer for cbuf index {}", cbuf_index);
-                                                     return NULL_BINDING;
-                                                 }
-
-                                                 const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-                                                 ASSERT_MSG(device_addr, "Unaligned storage buffer address not found for cbuf index {}",
-                                                            cbuf_index);
-
-                                                 const DAddr cpu_end = Common::AlignUp(*device_addr + size, Core::DEVICE_PAGESIZE);
-
-                                                 u32 binding_size = static_cast<u32>(cpu_end - *aligned_device_addr);
-                                                 if (is_written) {
-                                                     binding_size = aligned_size;
-                                                 }
-
-                                                 const Binding binding{
-                                                     .device_addr = *aligned_device_addr,
-                                                     .gpu_addr = aligned_gpu_addr,
-                                                     .size = binding_size,
-                                                     .buffer_id = BufferId{},
-                                                 };
-
-                                                 std::rotate(set.begin(), set.end() - 1, set.end());
-                                                 set[0] = {owner, gpu_addr, next_qword, serial, alignment, flags, binding};
-
-                                                 return binding;
-                                             }
+        u32 binding_size = static_cast<u32>(cpu_end - *aligned_device_addr);
+        if (is_written) {
+            binding_size = aligned_size;
+        }
+        return Binding{
+            .device_addr = *aligned_device_addr,
+            .gpu_addr = aligned_gpu_addr,
+            .size = binding_size,
+            .buffer_id = BufferId{},
+        };
+    }();
+    std::rotate(set.begin(), set.end() - 1, set.end());
+    set[0] = {owner, gpu_addr, next_qword, serial, alignment, flags, binding};
+    return binding;
+}
 
 template <class P>
 TextureBufferBinding BufferCache<P>::GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,

@@ -36,7 +36,6 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
-#include "video_core/buffer_cache/storage_binding_policy.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -602,7 +601,8 @@ private:
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
-                                                StorageBindingPolicy policy) const;
+                                               bool native_pointer = false,
+                                               bool table_pointer = false) const;
 
     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,
