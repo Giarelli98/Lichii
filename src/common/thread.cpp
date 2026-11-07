@@ -566,6 +566,17 @@ void SetCurrentThreadToBackgroundWork() {
 #endif
 }
 
+void SetCurrentThreadIdealCore(u32 logical_core) {
+#ifdef _WIN32
+    const DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (count > 0 && logical_core < count) {
+        SetThreadIdealProcessor(GetCurrentThread(), static_cast<DWORD>(logical_core));
+    }
+#else
+    (void)logical_core;
+#endif
+}
+
 void SetCurrentThreadToAllCores() {
 #if defined(__ANDROID__)
     ADPF::RemoveCurrentThread();

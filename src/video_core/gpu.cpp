@@ -51,6 +51,15 @@
 
 namespace Tegra {
 
+/// EDEN_NX2_AGGRESSIVE=1: turns on every opt-in speed switch at once.
+bool Nx2Aggressive() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_AGGRESSIVE");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
 struct GPU::Impl {
     explicit Impl(Core::System& system_, bool is_async_, bool use_nvdec_)
         : system{system_}
@@ -327,6 +336,32 @@ struct GPU::Impl {
             std::scoped_lock lock{lag_mutex};
             lagged = ++lag_pages[raster_area.start_address] > 16;
         }
+        // EDEN_NX2_READ_STABLE=1 (or EDEN_NX2_AGGRESSIVE): a small read (8 bytes or less) whose
+        // value came back the same the last 16 times it waited is not waited for: it gets the
+        // value of the previous download, which it would have seen anyway. Every 8th such read
+        // still waits and checks; one changed value makes that word wait again.
+        static const bool stable_reads = Nx2Aggressive() || [] {
+            const char* v = std::getenv("EDEN_NX2_READ_STABLE");
+            return v && v[0] == '1';
+        }();
+        struct StableWord {
+            u64 value{};
+            u32 same{};
+            u32 skipped{};
+        };
+        static std::mutex stable_mutex;
+        static std::unordered_map<DAddr, StableWord> stable_words;
+        const bool small_read = stable_reads && size <= 8;
+        if (small_read && !lagged) {
+            std::scoped_lock lock{stable_mutex};
+            StableWord& word = stable_words[addr];
+            if (word.same >= 16 && (++word.skipped & 7) != 0) {
+                lagged = true;
+            }
+            if (stable_words.size() > 65536) {
+                stable_words.clear();
+            }
+        }
         static std::atomic<u64> reads{};
         static std::atomic<u64> waited_us{};
         static std::atomic<u64> lagged_reads{};
@@ -348,7 +383,7 @@ struct GPU::Impl {
         // after another (Ocarina of Time: 2 x 4 bytes, then a handful more), and each read
         // waited for its own flush. Pages read back 8 times or more are flushed together with
         // whichever one traps; a page the GPU writes again afterwards traps again.
-        static const bool read_batch = [] {
+        static const bool read_batch = Nx2Aggressive() || [] {
             const char* v = std::getenv("EDEN_NX2_READ_BATCH");
             return v && v[0] == '1';
         }();
@@ -393,6 +428,14 @@ struct GPU::Impl {
                                                  std::chrono::steady_clock::now() - wait_start)
                                                  .count());
         waited_us.fetch_add(wait_us, std::memory_order_relaxed);
+        if (small_read) {
+            u64 value = 0;
+            system.Host1x().MemoryManager().ReadBlockUnsafe(addr, &value, size);
+            std::scoped_lock lock{stable_mutex};
+            StableWord& word = stable_words[addr];
+            word.same = (word.value == value) ? word.same + 1 : 0;
+            word.value = value;
+        }
         NoteCpuRead(raster_area, addr, size, wait_us, readback_kinds);
         return raster_area;
     }

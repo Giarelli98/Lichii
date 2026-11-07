@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -111,6 +113,24 @@ void SetCurrentThreadToPerformanceCores();
 void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();
 void SetCurrentThreadToAllCores();
+/// Windows: preferred logical processor for the scheduler (a hint, not a pin).
+void SetCurrentThreadIdealCore(u32 logical_core);
+
+// EDEN_NX2_GPU_CORES="front,back" (EDEN_NX2_AGGRESSIVE: "8,10"): preferred logical processors
+// for the GPU threads, two separate physical cores at the top of a 6-core/12-thread CPU, away
+// from where the guest cores usually land. A scheduler hint, not a pin.
+inline int Nx2GpuIdealCore(bool back) {
+    const char* cores = std::getenv("EDEN_NX2_GPU_CORES");
+    const char* aggressive = std::getenv("EDEN_NX2_AGGRESSIVE");
+    if (!(cores && cores[0]) && !(aggressive && aggressive[0] == '1')) {
+        return -1;
+    }
+    const char* spec = (cores && cores[0]) ? cores : "8,10";
+    char* end = nullptr;
+    const long front = std::strtol(spec, &end, 10);
+    const long back_core = (end && *end == ',') ? std::strtol(end + 1, nullptr, 10) : front + 2;
+    return static_cast<int>(back ? back_core : front);
+}
 
 void RefreshThreadPolicies();
 void PollThreadPolicies();

@@ -21,7 +21,8 @@ namespace VideoCommon::Nx2ReleaseTrack {
 inline bool Enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("EDEN_NX2_ACQUIRE_QUEUED");
-        return v && v[0] == '1';
+        const char* aggressive = std::getenv("EDEN_NX2_AGGRESSIVE");
+        return (v && v[0] == '1') || (aggressive && aggressive[0] == '1');
     }();
     return enabled;
 }
