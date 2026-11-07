@@ -214,7 +214,6 @@ private:
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 256;
 
-    template <typename Func>
     /// The deferred lambda's type as the compiler spells it: clang gives its file and line.
     template <typename Func>
     static const char* ThunkName() {
@@ -230,6 +229,7 @@ private:
     /// Back thread, with the profile: time one deferred call by its thunk.
     static void NoteThunk(u64 thunk, u64 ns);
 
+    template <typename Func>
     static void CallThunk(const u64* payload) {
         (*reinterpret_cast<const Func*>(payload))();
     }
