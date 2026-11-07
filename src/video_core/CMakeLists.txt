@@ -564,3 +564,8 @@ if (ENABLE_NVIDIA_DLSS)
 endif()
 
 create_target_directory_groups(video_core)
+
+if (WIN32)
+    # The host frame pacer reads the compositor timing (DwmGetCompositionTimingInfo).
+    target_link_libraries(video_core PRIVATE dwmapi)
+endif()
