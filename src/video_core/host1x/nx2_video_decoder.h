@@ -17,6 +17,9 @@ class Frame;
 
 namespace Tegra::Host1x {
 
+/// EDEN_NX2_VIDEO_THREADS (1-16, default 1): threads for converting and tiling movie frames.
+u32 Nx2VideoThreads();
+
 /// A picture decoded by Nx2VideoDecoder, in display order.
 struct Nx2Picture {
     u32 width{};
