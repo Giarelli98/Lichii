@@ -336,11 +336,12 @@ struct GPU::Impl {
             std::scoped_lock lock{lag_mutex};
             lagged = ++lag_pages[raster_area.start_address] > 16;
         }
-        // EDEN_NX2_READ_STABLE=1 (or EDEN_NX2_AGGRESSIVE): a small read (8 bytes or less) whose
+        // EDEN_NX2_READ_STABLE=1 (not part of EDEN_NX2_AGGRESSIVE: in Ocarina of Time these reads
+        // are occlusion results, and a stale one hid grass and flowers near Link): a small read (8 bytes or less) whose
         // value came back the same the last 16 times it waited is not waited for: it gets the
         // value of the previous download, which it would have seen anyway. Every 8th such read
         // still waits and checks; one changed value makes that word wait again.
-        static const bool stable_reads = Nx2Aggressive() || [] {
+        static const bool stable_reads = [] {
             const char* v = std::getenv("EDEN_NX2_READ_STABLE");
             return v && v[0] == '1';
         }();
