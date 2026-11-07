@@ -60,6 +60,9 @@ struct Runtime {
     u64 GetDeviceLocalMemory() const {
         return 0;
     }
+    u64 GetMaxStorageBufferRange() const {
+        return 1ULL << 30;
+    }
     u32 GetStorageBufferAlignment() const {
         return alignment;
     }
@@ -343,11 +346,11 @@ TEST_CASE("Storage binding cache preserves native and table size policies", "[bu
     f.Descriptor(base, 256);
     REQUIRE(f.Bind().size == 4096);
     REQUIRE(f.Bind(false, true).size == 8 << 20);
-    REQUIRE(f.Bind(false, false, true).size == 64 << 20);
+    REQUIRE(f.Bind(false, false, true).size == 80 << 20);
     REQUIRE(f.Bind(true, false, true).size == 256);
     f.Descriptor(base, (1ULL << 32) | 256);
     REQUIRE(f.Bind().size == 8 << 20);
-    REQUIRE(f.Bind(false, false, true).size == 64 << 20);
+    REQUIRE(f.Bind(false, false, true).size == 80 << 20);
     f.Descriptor(base + (79 << 20), 0);
     REQUIRE(f.Bind(false, false, true).size == 1 << 20);
 }
@@ -496,7 +499,7 @@ TEST_CASE("Command page batch publishes only completed matching write generation
     const std::array<DAddr, 1> requested{0x20000};
     f.cache->Nx2FlushListPages(requested);
     REQUIRE(f.runtime.finishes == 1);
-    REQUIRE(f.runtime.downloads == (mapped ? 0 : 3));
+    REQUIRE(f.runtime.downloads == (mapped ? 0U : 3U));
     REQUIRE(f.cache->Nx2ReadListCopy(0x20000, out, true) == Read::Synced);
     REQUIRE(f.cache->Nx2ReadListCopy(0x21000, out, true) == Read::Synced);
     REQUIRE(f.cache->Nx2ReadListCopy(0x22000, out, true) == Read::Unknown);

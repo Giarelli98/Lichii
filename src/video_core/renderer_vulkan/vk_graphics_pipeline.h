@@ -117,6 +117,16 @@ public:
         return fragment_has_color0_output;
     }
 
+    /// Color components of a render target the fragment shader writes, as VkColorComponentFlags
+    VkColorComponentFlags ColorOutputMask(size_t render_target) const noexcept {
+        return (color_output_mask >> (render_target * 4)) & 0xF;
+    }
+
+    /// Color components the fragment shader writes, 4 bits per render target
+    u32 ColorOutputMask() const noexcept {
+        return color_output_mask;
+    }
+
     bool UsesExtendedDynamicState() const noexcept {
         return key.state.extended_dynamic_state != 0;
     }
@@ -149,10 +159,17 @@ public:
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
     void MarkUsed(u64 frame) noexcept {
         last_use_frame = frame;
+        used = true;
     }
 
     [[nodiscard]] u64 LastUse() const noexcept {
         return last_use_frame;
+    }
+
+    /// Whether the cache has handed this pipeline out at all (frame 0 included), as opposed to a
+    /// pipeline prebuilt from the disk cache that no draw has used yet.
+    [[nodiscard]] bool WasUsed() const noexcept {
+        return used;
     }
 
     /// Forgets the transitions, which may point to pipelines the cache evicted.
@@ -163,6 +180,11 @@ public:
 
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
+    }
+
+    /// Waits up to `timeout` for the build; true when built.
+    [[nodiscard]] bool WaitBuilt(std::chrono::microseconds timeout) const {
+        return build->WaitFor(timeout);
     }
 
     [[nodiscard]] bool Failed() const noexcept {
@@ -206,6 +228,7 @@ private:
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
     u64 last_use_frame{};
+    bool used{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
 
@@ -217,6 +240,7 @@ private:
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
     bool fragment_has_color0_output{};
+    u32 color_output_mask{};
     bool writes_storage{};
 
     vk::DescriptorSetLayout descriptor_set_layout;

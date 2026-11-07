@@ -422,8 +422,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
-    if (const int core = Common::Nx2GpuIdealCore(true); core >= 0) {
-        Common::SetCurrentThreadIdealCore(static_cast<u32>(core));
+    if (Settings::values.pin_gpu_threads.GetValue() || Common::Nx2GpuIdealCore(true) >= 0) {
+        Common::PinCurrentThread(Common::PinnedRole::GpuBack);
     }
     system->RegisterHostThread();
 #ifdef _WIN32
