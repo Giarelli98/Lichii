@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <vector>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -35,6 +37,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
@@ -228,6 +231,79 @@ struct GPU::Impl {
         gpu_thread.FlushRegion(addr, size, is_async);
     }
 
+    u32 ReadbackKinds(const VideoCore::RasterizerDownloadArea& area) {
+        if (!VideoCommon::Nx2Profile::Enabled()) {
+            return 0;
+        }
+        u32 kinds = 0;
+        auto* rasterizer = renderer->ReadRasterizer();
+        const u64 area_size = area.end_address - area.start_address;
+        if (rasterizer->MustFlushRegion(area.start_address, area_size,
+                                        VideoCommon::CacheType::BufferCache)) {
+            kinds |= 1;
+        }
+        if (rasterizer->MustFlushRegion(area.start_address, area_size,
+                                        VideoCommon::CacheType::TextureCache)) {
+            kinds |= 2;
+        }
+        if (rasterizer->MustFlushRegion(area.start_address, area_size,
+                                        VideoCommon::CacheType::QueryCache)) {
+            kinds |= 4;
+        }
+        return kinds;
+    }
+
+    // With EDEN_NX2_GPU_PROFILE: which GPU-written areas the guest CPU reads back, every 10 s the
+    // ten that cost the most waiting, with what holds the GPU data (buffer, texture, query cache).
+    void NoteCpuRead(const VideoCore::RasterizerDownloadArea& area, DAddr addr, u64 size,
+                     u64 wait_us, u32 kinds) {
+        if (!VideoCommon::Nx2Profile::Enabled()) {
+            return;
+        }
+        struct Stat {
+            u64 reads{}, wait_us{}, max_us{}, end{}, min_read{~0ULL}, max_read{};
+            u32 kinds{};
+        };
+        static std::mutex mutex;
+        static std::unordered_map<DAddr, Stat> stats;
+        static auto window = std::chrono::steady_clock::now();
+        std::scoped_lock lock{mutex};
+        Stat& stat = stats[area.start_address];
+        ++stat.reads;
+        stat.wait_us += wait_us;
+        stat.max_us = std::max(stat.max_us, wait_us);
+        stat.end = area.end_address;
+        stat.min_read = std::min<u64>(stat.min_read, addr);
+        stat.max_read = std::max<u64>(stat.max_read, addr + size);
+        stat.kinds |= kinds;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window < std::chrono::seconds{10}) {
+            return;
+        }
+        window = now;
+        std::vector<std::pair<DAddr, Stat>> sorted(stats.begin(), stats.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b) { return a.second.wait_us > b.second.wait_us; });
+        u64 total_reads = 0, total_us = 0;
+        for (const auto& [start, st] : sorted) {
+            total_reads += st.reads;
+            total_us += st.wait_us;
+        }
+        LOG_INFO(HW_GPU, "CPU readbacks last 10 s: {} reads, {:.0f} ms waited, {} areas", total_reads,
+                 total_us / 1000.0, sorted.size());
+        for (size_t i = 0; i < std::min<size_t>(10, sorted.size()); ++i) {
+            const auto& [start, st] = sorted[i];
+            LOG_INFO(HW_GPU,
+                     "  area [{:#x}, {:#x}) {} KiB: {} reads, {:.1f} ms waited (max {:.1f}), "
+                     "reads within [{:#x}, {:#x}), held by{}{}{}{}",
+                     start, st.end, (st.end - start) >> 10, st.reads, st.wait_us / 1000.0,
+                     st.max_us / 1000.0, st.min_read, st.max_read,
+                     (st.kinds & 1) ? " buffer" : "", (st.kinds & 2) ? " texture" : "",
+                     (st.kinds & 4) ? " query" : "", st.kinds == 0 ? " nothing" : "");
+        }
+        stats.clear();
+    }
+
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
         if (raster_area.preemtive) {
@@ -266,6 +342,7 @@ struct GPU::Impl {
                      lagged_reads.load(std::memory_order_relaxed),
                      waited_us.load(std::memory_order_relaxed));
         }
+        const u32 readback_kinds = ReadbackKinds(raster_area);
         const u64 fence = RequestSyncOperation([this, raster_area]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();
@@ -277,10 +354,11 @@ struct GPU::Impl {
         }
         const auto wait_start = std::chrono::steady_clock::now();
         WaitForSyncOperation(fence);
-        waited_us.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+        const u64 wait_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                  std::chrono::steady_clock::now() - wait_start)
-                                                 .count()),
-                            std::memory_order_relaxed);
+                                                 .count());
+        waited_us.fetch_add(wait_us, std::memory_order_relaxed);
+        NoteCpuRead(raster_area, addr, size, wait_us, readback_kinds);
         return raster_area;
     }
 
