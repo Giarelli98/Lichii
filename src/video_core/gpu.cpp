@@ -22,6 +22,7 @@
 #include "common/settings_enums.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/device_memory_manager.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
@@ -343,10 +344,44 @@ struct GPU::Impl {
                      waited_us.load(std::memory_order_relaxed));
         }
         const u32 readback_kinds = ReadbackKinds(raster_area);
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
+        // EDEN_NX2_READ_BATCH=1: the game reads a few GPU-written words back every frame, one
+        // after another (Ocarina of Time: 2 x 4 bytes, then a handful more), and each read
+        // waited for its own flush. Pages read back 8 times or more are flushed together with
+        // whichever one traps; a page the GPU writes again afterwards traps again.
+        static const bool read_batch = [] {
+            const char* v = std::getenv("EDEN_NX2_READ_BATCH");
+            return v && v[0] == '1';
+        }();
+        std::vector<DAddr> batch;
+        if (read_batch) {
+            static std::mutex hot_mutex;
+            static std::unordered_map<DAddr, u32> hot_pages;
+            std::scoped_lock lock{hot_mutex};
+            u32& count = hot_pages[raster_area.start_address];
+            if (count < 1'000'000) {
+                ++count;
+            }
+            if (hot_pages.size() > 4096) {
+                hot_pages.clear();
+            }
+            for (const auto& [page, n] : hot_pages) {
+                if (n >= 8 && page != raster_area.start_address && batch.size() < 32) {
+                    batch.push_back(page);
+                }
+            }
+        }
+        const u64 fence = RequestSyncOperation([this, raster_area, batch = std::move(batch)]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();
-            renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
+            auto* rasterizer = renderer->ReadRasterizer();
+            rasterizer->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
+            for (const DAddr page : batch) {
+                if (rasterizer->MustFlushRegion(page, Core::DEVICE_PAGESIZE,
+                                                VideoCommon::CacheType::BufferCache)) {
+                    rasterizer->FlushRegion(page, Core::DEVICE_PAGESIZE,
+                                            VideoCommon::CacheType::BufferCache);
+                }
+            }
         });
         gpu_thread.TickGPU(is_async);
         if (lagged) {
