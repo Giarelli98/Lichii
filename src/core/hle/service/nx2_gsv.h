@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <unordered_map>
 #include <array>
 #include <thread>
 #include <chrono>
@@ -2614,6 +2615,11 @@ private:
     std::optional<std::chrono::steady_clock::time_point> m_clock_base;
     std::chrono::steady_clock::time_point m_last_out_wall{};
     u64 m_dropped{};
+    std::unordered_map<u32, std::chrono::steady_clock::time_point> m_out_time;
+    std::chrono::steady_clock::time_point m_last_release{};
+    double m_held_avg_us{};
+    double m_gap_avg_us{};
+    s64 m_auto_lead_us{150'000};
     static bool VideoRealtime() {
         static const bool enabled = [] {
             const char* v = std::getenv("EDEN_NX2_VIDEO_REALTIME");
@@ -2753,6 +2759,28 @@ private:
             m_free.push_back(image);
             if (release_fence) {
                 m_release_fences[image] = *release_fence;
+                // Auto lead: a frame is on screen between the game taking it and giving the image
+                // back. Its delay is the time from filling the image to the release, less half
+                // the time between releases (about one game frame).
+                const auto now = std::chrono::steady_clock::now();
+                if (const auto it = m_out_time.find(image); it != m_out_time.end()) {
+                    const s64 held = std::chrono::duration_cast<std::chrono::microseconds>(
+                                         now - it->second)
+                                         .count();
+                    const s64 gap = m_last_release.time_since_epoch().count() == 0
+                                        ? 0
+                                        : std::chrono::duration_cast<std::chrono::microseconds>(
+                                              now - m_last_release)
+                                              .count();
+                    if (held > 0 && held < 2'000'000 && gap < 500'000) {
+                        m_held_avg_us += (static_cast<double>(held) - m_held_avg_us) / 16.0;
+                        m_gap_avg_us += (static_cast<double>(gap) - m_gap_avg_us) / 16.0;
+                        m_auto_lead_us = static_cast<s64>(
+                            std::clamp(m_held_avg_us - m_gap_avg_us / 2.0, 0.0, 600'000.0));
+                    }
+                    m_out_time.erase(it);
+                }
+                m_last_release = now;
             }
             // Mario Kart World waits for returned images after a movie and acquires a frame for
             // each completed fence, so its released images need synthetic end-of-stream frames.
@@ -2988,10 +3016,17 @@ private:
                     }
                     // EDEN_NX2_VIDEO_LEAD_MS (default 150): how far ahead of the audio a frame is
                     // handed out, for the images the game queues before it shows one.
-                    static const auto lead = std::chrono::milliseconds{[] {
+                    // Unset or "auto": measured from the game's own queue (see ReleaseBuffer).
+                    static const long fixed_lead_ms = [] {
                         const char* v = std::getenv("EDEN_NX2_VIDEO_LEAD_MS");
-                        return v && v[0] ? std::strtol(v, nullptr, 10) : 150L;
-                    }()};
+                        if (!v || !v[0] || v[0] == 'a') {
+                            return -1L;
+                        }
+                        return std::strtol(v, nullptr, 10);
+                    }();
+                    const auto lead = fixed_lead_ms >= 0
+                                          ? std::chrono::microseconds{fixed_lead_ms * 1000}
+                                          : std::chrono::microseconds{m_auto_lead_us};
                     const Decoded& next = m_decoded.front();
                     const auto due =
                         *m_clock_base + std::chrono::microseconds{next.pts} - lead;
@@ -3025,6 +3060,7 @@ private:
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
                 m_last_out_wall = std::chrono::steady_clock::now();
+                m_out_time[image] = m_last_out_wall;
                 if (frame.end) {
                     m_clock_base.reset();
                     m_stream_ended = true;
@@ -3053,9 +3089,12 @@ private:
                             : std::chrono::duration<double, std::milli>(now - m_window_start).count();
                     LOG_INFO(Service,
                              "{} last 120 frames: decode {:.2f} ms, write {:.2f} ms a frame; "
-                             "{:.1f} fps out, pts {:.2f} s, {} dropped so far",
+                             "{:.1f} fps out, pts {:.2f} s, {} dropped so far, auto lead {:.0f} ms "
+                             "(held {:.0f} ms, release gap {:.0f} ms)",
                              GetServiceName(), m_decode_us / 120000.0, m_write_us / 120000.0,
-                             wall_ms > 0 ? 120000.0 / wall_ms : 0.0, frame.pts / 1e6, m_dropped);
+                             wall_ms > 0 ? 120000.0 / wall_ms : 0.0, frame.pts / 1e6, m_dropped,
+                             m_auto_lead_us / 1000.0, m_held_avg_us / 1000.0,
+                             m_gap_avg_us / 1000.0);
                     m_decode_us = 0;
                     m_write_us = 0;
                     m_window_start = now;
