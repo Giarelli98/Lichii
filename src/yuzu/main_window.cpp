@@ -8,6 +8,7 @@
 #undef VMA_IMPLEMENTATION
 #endif
 
+#include <cstdlib>
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
@@ -376,7 +377,12 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     Common::FS::CreateEdenPaths();
     this->config = std::make_unique<QtConfig>();
-    MigrateFriztiSettings();
+    // Frizti's tuned-settings migration rewrote this user's per-game Ocarina settings (fence
+    // behavior, DMA accuracy, VSync and more) on first launch; this fork keeps the user's own.
+    // EDEN_NX2_FRIZTI_SETTINGS=1 brings it back.
+    if (const char* v = std::getenv("EDEN_NX2_FRIZTI_SETTINGS"); v && v[0] == '1') {
+        MigrateFriztiSettings();
+    }
 
     Common::Log::Filter filter;
     filter.ParseFilterString(Settings::values.log_filter.GetValue());
