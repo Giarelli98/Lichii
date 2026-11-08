@@ -108,14 +108,14 @@ constexpr std::array DYNAMIC_FPS_RECORDS{
 // z-prepass occlusion queries and no samples-passed queries (ldrb w8, [x0] -> mov w8, wzr), so it
 // issues no occlusion reports and no conditional renders; every candidate object is drawn.
 constexpr std::array<u8, 4> MOV_W8_WZR{0xE8, 0x03, 0x1F, 0x2A};
-constexpr u32 LDRB_W8_X0 = 0x39400008;
+constexpr std::array<u8, 4> LDRB_W8_X0{0x08, 0x00, 0x40, 0x39}; // ldrb w8, [x0]
 constexpr std::array OCCLUSION_OFF_RECORDS{
-    BuiltinPatchRecord{.module_offset = 0x11ACE68, .bytes = MOV_W8_WZR, .checked = true, .original = LDRB_W8_X0},
-    BuiltinPatchRecord{.module_offset = 0x11B828C, .bytes = MOV_W8_WZR, .checked = true, .original = LDRB_W8_X0},
-    BuiltinPatchRecord{.module_offset = 0x11B82A4, .bytes = MOV_W8_WZR, .checked = true, .original = LDRB_W8_X0},
-    BuiltinPatchRecord{.module_offset = 0x11ACEC8, .bytes = MOV_W8_WZR, .checked = true, .original = LDRB_W8_X0},
-    BuiltinPatchRecord{.module_offset = 0x11B82DC, .bytes = MOV_W8_WZR, .checked = true, .original = LDRB_W8_X0},
-    BuiltinPatchRecord{.module_offset = 0x11B82F4, .bytes = MOV_W8_WZR, .checked = true, .original = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11ACE68, .bytes = MOV_W8_WZR, .original = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11B828C, .bytes = MOV_W8_WZR, .original = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11B82A4, .bytes = MOV_W8_WZR, .original = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11ACEC8, .bytes = MOV_W8_WZR, .original = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11B82DC, .bytes = MOV_W8_WZR, .original = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11B82F4, .bytes = MOV_W8_WZR, .original = LDRB_W8_X0},
 };
 
 constexpr std::array BUILTIN_PATCHES{
