@@ -3,12 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <optional>
-#include <cstdlib>
 #include <set>
 #include <thread>
-#include <vector>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -22,7 +21,7 @@ extern "C" {
 #pragma GCC diagnostic ignored "-Wconversion"
 #endif
 
-#include <libavutil/pixdesc.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -49,6 +48,12 @@ std::optional<NvdecCommon::VideoCodec> CodecFromMime(std::string_view mime) {
         return NvdecCommon::VideoCodec::H264;
     }
     return std::nullopt;
+}
+
+// dav1d defaults to a thread per host thread. A 1080p60 movie needs a few, and the emulator's
+// own threads need the rest.
+int Dav1dThreads() {
+    return static_cast<int>(std::clamp(std::thread::hardware_concurrency() / 2, 2U, 8U));
 }
 
 } // namespace
@@ -98,7 +103,6 @@ struct Nx2VideoDecoder::Impl {
     std::optional<FFmpeg::HardwareContext> hardware;
     std::optional<FFmpeg::DecoderContext> context;
     SwsContext* scaler{};
-    std::vector<SwsContext*> band_scalers; ///< EDEN_NX2_VIDEO_THREADS: one per row band
     bool open{};
     H264PacketConverter h264_packets;
     /// Timestamps of submitted frames not yet output. Frames copied back from a host GPU decoder
@@ -108,9 +112,6 @@ struct Nx2VideoDecoder::Impl {
 
     ~Impl() {
         sws_freeContext(scaler);
-        for (SwsContext* band : band_scalers) {
-            sws_freeContext(band);
-        }
         context.reset();
         hardware.reset();
     }
@@ -136,17 +137,9 @@ struct Nx2VideoDecoder::Impl {
     }
 };
 
-u32 Nx2VideoThreads() {
-    static const u32 threads = [] {
-        const char* v = std::getenv("EDEN_NX2_VIDEO_THREADS");
-        const unsigned long n = v && v[0] ? std::strtoul(v, nullptr, 10) : 1;
-        return static_cast<u32>(std::clamp<unsigned long>(n, 1, 16));
-    }();
-    return threads;
-}
-
 Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<Impl>()} {
     impl->name = std::string{mime};
+    const auto start = std::chrono::steady_clock::now();
     const auto codec = CodecFromMime(mime);
     if (!codec) {
         LOG_ERROR(HW_GPU, "nx2 video: no decoder for codec \"{}\"", mime);
@@ -158,12 +151,33 @@ Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<
         return;
     }
     impl->context.emplace(*impl->decoder);
-    if (Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
+    AVCodecContext* const context = impl->context->GetCodecContext();
+    const std::string_view decoder_name = impl->decoder->GetCodec()->name;
+    if (decoder_name == "libdav1d") {
+        context->thread_count = Dav1dThreads();
+    }
+    const bool gpu = Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu;
+    if (gpu) {
         impl->hardware.emplace();
         impl->hardware->InitializeForDecoder(*impl->context, *impl->decoder);
     }
     impl->open = impl->context->OpenContext(*impl->decoder);
-    LOG_INFO(HW_GPU, "nx2 video: decoder for \"{}\" {}", mime, impl->open ? "open" : "failed to open");
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    if (!impl->open) {
+        LOG_ERROR(HW_GPU, "nx2 video: {} failed to open for \"{}\"", decoder_name, mime);
+    } else if (context->hw_device_ctx) {
+        const auto* device =
+            reinterpret_cast<const AVHWDeviceContext*>(context->hw_device_ctx->data);
+        LOG_INFO(HW_GPU, "nx2 video: \"{}\" decodes on the GPU ({}) with {}, opened in {} ms", mime,
+                 av_hwdevice_get_type_name(device->type), decoder_name, ms);
+    } else {
+        LOG_INFO(HW_GPU,
+                 "nx2 video: \"{}\" decodes on the CPU with {}, {} threads ({}), opened in {} ms",
+                 mime, decoder_name, context->thread_count,
+                 gpu ? "no usable GPU decoder" : "NVDEC emulation is CPU", ms);
+    }
 }
 
 Nx2VideoDecoder::~Nx2VideoDecoder() = default;
@@ -260,80 +274,6 @@ void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format,
             }
         }
         return;
-    }
-    // EDEN_NX2_VIDEO_THREADS=N: convert an unscaled frame in N row bands at once. Each band is
-    // its own small image (planes offset to its first row), so no slice-order rules apply.
-    const auto* desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(f->format));
-    const u32 bands = Nx2VideoThreads();
-    if (bands > 1 && desc != nullptr && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL) &&
-        static_cast<u32>(f->width) == width && static_cast<u32>(f->height) == height &&
-        height >= bands * 32) {
-        int space = SWS_CS_ITU601;
-        if (f->colorspace == AVCOL_SPC_BT709 ||
-            (f->colorspace == AVCOL_SPC_UNSPECIFIED && f->height >= 720)) {
-            space = SWS_CS_ITU709;
-        } else if (f->colorspace == AVCOL_SPC_BT2020_NCL || f->colorspace == AVCOL_SPC_BT2020_CL) {
-            space = SWS_CS_BT2020;
-        }
-        const bool full_range = f->color_range == AVCOL_RANGE_JPEG ||
-                                f->format == AV_PIX_FMT_YUVJ420P ||
-                                f->format == AV_PIX_FMT_YUVJ422P ||
-                                f->format == AV_PIX_FMT_YUVJ444P;
-        const int* coefficients = sws_getCoefficients(space);
-        // Band heights: a multiple of 16 rows, so chroma rows split evenly.
-        const u32 band_rows = ((height + bands - 1) / bands + 15) & ~15U;
-        impl->band_scalers.resize(bands, nullptr);
-        std::vector<std::thread> workers;
-        workers.reserve(bands);
-        bool failed = false;
-        for (u32 b = 0; b < bands; ++b) {
-            const u32 y0 = b * band_rows;
-            if (y0 >= height) {
-                break;
-            }
-            const u32 rows = std::min(band_rows, height - y0);
-            SwsContext*& ctx = impl->band_scalers[b];
-            ctx = sws_getCachedContext(ctx, f->width, static_cast<int>(rows),
-                                       static_cast<AVPixelFormat>(f->format),
-                                       static_cast<int>(width), static_cast<int>(rows), target,
-                                       SWS_BILINEAR, nullptr, nullptr, nullptr);
-            if (ctx == nullptr) {
-                failed = true;
-                break;
-            }
-            sws_setColorspaceDetails(ctx, coefficients, full_range, coefficients,
-                                     format != Nx2PictureFormat::Nv12, 0, 1 << 16, 1 << 16);
-        }
-        if (!failed) {
-            for (u32 b = 0; b < bands; ++b) {
-                const u32 y0 = b * band_rows;
-                if (y0 >= height) {
-                    break;
-                }
-                const u32 rows = std::min(band_rows, height - y0);
-                workers.emplace_back([&, b, y0, rows] {
-                    std::array<const u8*, 4> src{};
-                    std::array<int, 4> src_stride{};
-                    for (int p = 0; p < 4 && f->data[p] != nullptr; ++p) {
-                        const u32 shift = (p == 1 || p == 2) ? desc->log2_chroma_h : 0;
-                        src[p] = f->data[p] + static_cast<ptrdiff_t>(y0 >> shift) * f->linesize[p];
-                        src_stride[p] = f->linesize[p];
-                    }
-                    std::array<u8*, 4> dst{out.data() + y0 * pitch, nullptr, nullptr, nullptr};
-                    std::array<int, 4> dst_stride{static_cast<int>(pitch), 0, 0, 0};
-                    if (format == Nx2PictureFormat::Nv12) {
-                        dst[1] = out.data() + chroma_offset + (y0 / 2) * pitch;
-                        dst_stride[1] = static_cast<int>(pitch);
-                    }
-                    sws_scale(impl->band_scalers[b], src.data(), src_stride.data(), 0,
-                              static_cast<int>(rows), dst.data(), dst_stride.data());
-                });
-            }
-            for (auto& worker : workers) {
-                worker.join();
-            }
-            return;
-        }
     }
     impl->scaler = sws_getCachedContext(impl->scaler, f->width, f->height,
                                         static_cast<AVPixelFormat>(f->format),

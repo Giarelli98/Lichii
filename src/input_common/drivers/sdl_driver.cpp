@@ -5,16 +5,13 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <numbers>
-#include <vector>
 #include "common/logging.h"
 #include "common/math_util.h"
 #include "common/param_package.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "common/vector_math.h"
-#include "input_common/drivers/renhdrum_pad.h"
 #include "input_common/drivers/sdl_driver.h"
 
 namespace InputCommon {
@@ -95,13 +92,6 @@ public:
                 : guid{guid_}, port{port_}, sdl_joystick{joystick, &SDL_CloseJoystick},
                     sdl_controller{game_controller, &SDL_CloseGamepad} {
         EnableMotion();
-        renhdrum = RenHDrumPad::Create(joystick, game_controller);
-    }
-
-    ~SDLJoystick() {
-        if (renhdrum) {
-            renhdrum->Shutdown();
-        }
     }
 
     void EnableMotion() {
@@ -109,6 +99,7 @@ public:
             return;
         }
         SDL_Gamepad* controller = sdl_controller.get();
+        last_motion_report = std::chrono::steady_clock::now();
         if (HasMotion()) {
             SDL_SetGamepadSensorEnabled(controller, SDL_SENSOR_ACCEL, false);
             SDL_SetGamepadSensorEnabled(controller, SDL_SENSOR_GYRO, false);
@@ -141,9 +132,24 @@ public:
         return has_gyro || has_accel;
     }
 
+    /// A connected controller with sensors that sent no report for a while: some controllers
+    /// stop reporting when another program (Steam Input) changes their sensor mode, or after
+    /// they reconnect. Returns true when EnableMotion should restart them, backing off up to
+    /// MaxMotionStallRetry while they stay silent.
+    bool IsMotionStalled(std::chrono::steady_clock::time_point now) {
+        std::scoped_lock lock{mutex};
+        if (!sdl_controller || !HasMotion() || now - last_motion_report < motion_stall_retry) {
+            return false;
+        }
+        motion_stall_retry = (std::min)(motion_stall_retry * 2, MaxMotionStallRetry);
+        return true;
+    }
+
     bool UpdateMotion(SDL_GamepadSensorEvent event) {
         constexpr float gravity_constant = 9.80665f;
         std::scoped_lock lock{mutex};
+        last_motion_report = std::chrono::steady_clock::now();
+        motion_stall_retry = InitialMotionStallRetry;
         const u64 sensor_timestamp = event.sensor_timestamp != 0 ? event.sensor_timestamp
                                                                  : event.timestamp;
 
@@ -243,10 +249,6 @@ public:
     }
 
     bool HasHDRumble() const {
-        if (const auto pad = GetRenHDrum(); pad && pad->IsActive()) {
-            return true;
-        }
-
         constexpr Uint16 valve_vendor_id = 0x28DE;
         const auto is_known_hd_type = [](SDL_GamepadType type) {
             return type == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO ||
@@ -320,25 +322,8 @@ public:
     }
 
     void SetSDLJoystick(SDL_Joystick* joystick, SDL_Gamepad* controller) {
-        std::shared_ptr<RenHDrumPad> old_pad;
-        {
-            std::scoped_lock lock{renhdrum_mutex};
-            old_pad = std::move(renhdrum);
-        }
-        if (old_pad) {
-            old_pad->Shutdown();
-        }
         sdl_joystick.reset(joystick);
         sdl_controller.reset(controller);
-        auto new_pad = RenHDrumPad::Create(joystick, controller);
-        std::scoped_lock lock{renhdrum_mutex};
-        renhdrum = std::move(new_pad);
-    }
-
-    /// RenHDrum for this controller, or nullptr when it uses the standard rumble.
-    std::shared_ptr<RenHDrumPad> GetRenHDrum() const {
-        std::scoped_lock lock{renhdrum_mutex};
-        return renhdrum;
     }
 
     bool IsJoyconLeft() const {
@@ -437,14 +422,15 @@ private:
     std::unique_ptr<SDL_Gamepad, decltype(&SDL_CloseGamepad)> sdl_controller;
     mutable std::mutex mutex;
 
-    mutable std::mutex renhdrum_mutex;
-    std::shared_ptr<RenHDrumPad> renhdrum;
-
     u64 last_motion_update{};
     static constexpr std::size_t InitialMotionRestartThreshold = 200;
     static constexpr std::size_t MaxMotionRestartThreshold = 200 * 64;
     std::size_t motion_error_count{};
     std::size_t motion_restart_threshold{InitialMotionRestartThreshold};
+    static constexpr std::chrono::milliseconds InitialMotionStallRetry{1000};
+    static constexpr std::chrono::milliseconds MaxMotionStallRetry{8000};
+    std::chrono::steady_clock::time_point last_motion_report{};
+    std::chrono::milliseconds motion_stall_retry{InitialMotionStallRetry};
     bool motion_capabilities_logged{false};
     bool logged_accel{false};
     bool logged_gyro{false};
@@ -621,33 +607,25 @@ void SDLDriver::CloseJoystick(SDL_Joystick* sdl_joystick) {
     }
 }
 
-void SDLDriver::PumpEvents() const {
+void SDLDriver::PumpEvents() {
     if (!initialized) {
         return;
     }
     SDL_PumpEvents();
-
-    // RenHDrum paces HD Rumble packets itself; due ones go out here. The pads are ticked after
-    // the map lock is released: a tick calls into SDL, and SDL's controller-added callback can
-    // hold the SDL joystick lock while it waits for the map lock.
-    std::vector<std::shared_ptr<RenHDrumPad>> pads;
-    {
-        std::scoped_lock lock{joystick_map_mutex};
-        for (const auto& [guid, joystick_list] : joystick_map) {
-            for (const auto& joystick : joystick_list) {
-                if (auto pad = joystick->GetRenHDrum()) {
-                    pads.push_back(std::move(pad));
-                }
-            }
-        }
-    }
-    if (pads.empty()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_motion_stall_check < std::chrono::milliseconds{250}) {
         return;
     }
-    const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-    for (const auto& pad : pads) {
-        pad->Tick(now_us);
+    last_motion_stall_check = now;
+    std::scoped_lock lock{joystick_map_mutex};
+    for (const auto& [guid, joysticks] : joystick_map) {
+        for (const auto& joystick : joysticks) {
+            if (joystick->IsMotionStalled(now)) {
+                LOG_INFO(Input, "Motion sensor of {} port {} stopped reporting, restarting it",
+                         joystick->GetControllerName(), joystick->GetPort());
+                joystick->EnableMotion();
+            }
+        }
     }
 }
 
@@ -847,18 +825,6 @@ Common::Input::DriverResult SDLDriver::SetVibration(
     const PadIdentifier& identifier, const Common::Input::VibrationStatus& vibration) {
     const auto joystick =
         GetSDLJoystickByGUID(identifier.guid.RawString(), static_cast<int>(identifier.port));
-    if (!joystick) {
-        return Common::Input::DriverResult::InvalidHandle;
-    }
-
-    if (const auto pad = joystick->GetRenHDrum()) {
-        const auto now = std::chrono::steady_clock::now().time_since_epoch();
-        const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-        if (pad->Vibrate(now_us, identifier.pad == 1, vibration)) {
-            return Common::Input::DriverResult::Success;
-        }
-    }
-
     const auto process_amplitude_exp = [](f32 amplitude, f32 factor) {
         return (amplitude + std::pow(amplitude, factor)) * 0.5f * 0xFFFF;
     };
@@ -909,18 +875,8 @@ bool SDLDriver::IsVibrationEnabled(const PadIdentifier& identifier) {
         .type = Common::Input::VibrationAmplificationType::Exponential,
     };
 
-    if (!joystick) {
-        return false;
-    }
-
     if (joystick->IsVibrationTested()) {
         return joystick->HasVibration();
-    }
-
-    // RenHDrum drives the pad without SDL's rumble, so the test rumble below would prove nothing
-    if (joystick->GetRenHDrum()) {
-        joystick->EnableVibration(true);
-        return true;
     }
 
     // First vibration might fail
