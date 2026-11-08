@@ -4,7 +4,6 @@
 #include "core/loader/nup.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 
 #include "common/logging.h"
@@ -101,22 +100,10 @@ std::string DecodeVersion(u32 version) {
     return fmt::format("{}.{}.{}", version >> 16, (version >> 8) & 0xFF, version & 0xFF);
 }
 
-// EDEN_NX2_NUP_CACHE_MB=<MiB>: in-memory cache of decompressed zstd members (default 512).
-// Area changes re-decompress members the LRU dropped; more RAM keeps them.
-std::size_t NupCacheCap() {
-    const char* v = std::getenv("EDEN_NX2_NUP_CACHE_MB");
-    const unsigned long long mib = v && v[0] ? std::strtoull(v, nullptr, 10) : 0;
-    if (mib == 0) {
-        return FileSys::NupDecompressCache::DefaultCap;
-    }
-    LOG_INFO(Loader, "NUP decompression cache: {} MiB", mib);
-    return static_cast<std::size_t>(std::min<unsigned long long>(mib, 24576)) << 20;
-}
-
 } // namespace
 
 AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
-    : AppLoader(std::move(file_)), nup(std::make_unique<NupContainer>(file, NupCacheCap())) {
+    : AppLoader(std::move(file_)), nup(std::make_unique<NupContainer>(file)) {
     if (nup->GetStatus() != ResultStatus::Success) {
         return;
     }
