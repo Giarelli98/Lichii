@@ -79,15 +79,13 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
-        bool reported;
-        u32 unmet_polls{};
-        /// When the back was last drained for this acquire: registration, then every drained poll.
-        std::chrono::steady_clock::time_point last_drain{};
+        /// When an unmet poll last drained (CanResumeAcquire)
+        std::chrono::steady_clock::time_point last_drain;
+        bool reported; ///< The 2 s warning was logged
 
         [[nodiscard]] bool Matches(u32 current) const;
-        [[nodiscard]] bool CanDeferPoll(std::chrono::steady_clock::time_point now) {
-            return ++unmet_polls < 16 && now - last_drain < std::chrono::milliseconds{1};
-        }
+        /// Whether it waits for the word to reach `value` (greater or equal).
+        [[nodiscard]] bool WaitsToReach() const;
     };
 
     [[nodiscard]] bool HasPendingAcquire() const {
@@ -104,8 +102,6 @@ public:
     void CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_call);
     void CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subchannel, const u32* base_start, u32 amount, u32 methods_pending);
 private:
-    friend struct PullerTestAccess;
-
     static constexpr std::size_t NUM_REGS = 0x800;
     struct Regs {
         static constexpr size_t NUM_REGS = 0x40;

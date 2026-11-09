@@ -11,6 +11,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
+#include "video_core/nx2_profile.h"
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
@@ -197,6 +198,7 @@ PresentManager::~PresentManager() {
 
 Frame* PresentManager::GetRenderFrame() {
 
+    VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
     free_cv.wait(lock, [this] { return !free_queue.empty(); });
@@ -221,7 +223,10 @@ void PresentManager::Present(Frame* frame) {
             frame_cv.notify_one();
         });
     } else {
-        scheduler.WaitWorker();
+        {
+            VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
+            scheduler.WaitWorker();
+        }
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
     }

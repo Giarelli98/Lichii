@@ -4,25 +4,20 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <array>
-#include <vector>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <list>
 #include <memory>
-#include <cstdlib>
-#include <mutex>
-#include <unordered_map>
 #include <utility>
 
 #include "common/assert.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
 #include "core/core_timing.h"
-#include "core/device_memory_manager.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
@@ -39,7 +34,6 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
-#include "video_core/nx2_profile.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
@@ -47,19 +41,12 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_async_readback.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
 namespace Tegra {
-
-/// EDEN_NX2_AGGRESSIVE=1: turns on every opt-in speed switch at once.
-bool Nx2Aggressive() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("EDEN_NX2_AGGRESSIVE");
-        return v && v[0] == '1';
-    }();
-    return enabled;
-}
 
 struct GPU::Impl {
     explicit Impl(Core::System& system_, bool is_async_, bool use_nvdec_)
@@ -127,17 +114,37 @@ struct GPU::Impl {
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
         std::vector<std::pair<DAddr, u64>> writes;
-        std::function<void(PAddr, size_t)> callback_writes(
-            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
-        system.GatherGPUDirtyMemory(callback_writes);
-        if (!writes.empty()) {
-            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        {
+            // Gathered writes stay pending (ForEachPendingCpuWrite) until they are applied: a
+            // download written to guest memory meanwhile on another thread (FinishRead) would
+            // otherwise write the GPU's older bytes over them.
+            std::scoped_lock lock{applying_writes_mutex};
+            std::function<void(PAddr, size_t)> callback_writes(
+                [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+            system.GatherGPUDirtyMemory(callback_writes);
+            if (writes.empty()) {
+                return;
+            }
+            applying_writes.push_back(&writes);
         }
+        // Also if OnCacheInvalidations throws: ForEachPendingCpuWrite must not reach `writes`
+        // once it is gone.
+        SCOPE_EXIT {
+            std::scoped_lock lock{applying_writes_mutex};
+            std::erase(applying_writes, &writes);
+        };
+        renderer->ReadRasterizer()->OnCacheInvalidations(writes);
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+        std::scoped_lock lock{applying_writes_mutex};
         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
             manager.ForEachPending(callback);
+        }
+        for (const auto* writes : applying_writes) {
+            for (const auto& [address, size] : *writes) {
+                callback(address, size);
+            }
         }
     }
 
@@ -257,227 +264,47 @@ struct GPU::Impl {
         gpu_thread.FlushRegion(addr, size, is_async);
     }
 
-    std::atomic<u64> readback_queue_us{};
-    std::atomic<u64> readback_flush_us{};
-
-    u32 ReadbackKinds(const VideoCore::RasterizerDownloadArea& area) {
-        if (!VideoCommon::Nx2Profile::Enabled()) {
-            return 0;
-        }
-        u32 kinds = 0;
-        auto* rasterizer = renderer->ReadRasterizer();
-        const u64 area_size = area.end_address - area.start_address;
-        if (rasterizer->MustFlushRegion(area.start_address, area_size,
-                                        VideoCommon::CacheType::BufferCache)) {
-            kinds |= 1;
-        }
-        if (rasterizer->MustFlushRegion(area.start_address, area_size,
-                                        VideoCommon::CacheType::TextureCache)) {
-            kinds |= 2;
-        }
-        if (rasterizer->MustFlushRegion(area.start_address, area_size,
-                                        VideoCommon::CacheType::QueryCache)) {
-            kinds |= 4;
-        }
-        return kinds;
-    }
-
-    // With EDEN_NX2_GPU_PROFILE: which GPU-written areas the guest CPU reads back, every 10 s the
-    // ten that cost the most waiting, with what holds the GPU data (buffer, texture, query cache).
-    void NoteCpuRead(const VideoCore::RasterizerDownloadArea& area, DAddr addr, u64 size,
-                     u64 wait_us, u32 kinds) {
-        if (!VideoCommon::Nx2Profile::Enabled()) {
-            return;
-        }
-        struct Stat {
-            u64 reads{}, wait_us{}, max_us{}, end{}, min_read{~0ULL}, max_read{};
-            u32 kinds{};
-        };
-        static std::mutex mutex;
-        static std::unordered_map<DAddr, Stat> stats;
-        static auto window = std::chrono::steady_clock::now();
-        std::scoped_lock lock{mutex};
-        Stat& stat = stats[area.start_address];
-        ++stat.reads;
-        stat.wait_us += wait_us;
-        stat.max_us = std::max(stat.max_us, wait_us);
-        stat.end = area.end_address;
-        stat.min_read = std::min<u64>(stat.min_read, addr);
-        stat.max_read = std::max<u64>(stat.max_read, addr + size);
-        stat.kinds |= kinds;
-        const auto now = std::chrono::steady_clock::now();
-        if (now - window < std::chrono::seconds{10}) {
-            return;
-        }
-        window = now;
-        std::vector<std::pair<DAddr, Stat>> sorted(stats.begin(), stats.end());
-        std::sort(sorted.begin(), sorted.end(),
-                  [](const auto& a, const auto& b) { return a.second.wait_us > b.second.wait_us; });
-        u64 total_reads = 0, total_us = 0;
-        for (const auto& [start, st] : sorted) {
-            total_reads += st.reads;
-            total_us += st.wait_us;
-        }
-        LOG_INFO(HW_GPU,
-                 "CPU readbacks last 10 s: {} reads, {:.0f} ms waited, {} areas; of the wait "
-                 "{:.0f} ms before the GPU thread reached the read, {:.0f} ms flushing",
-                 total_reads, total_us / 1000.0, sorted.size(),
-                 readback_queue_us.exchange(0) / 1000.0, readback_flush_us.exchange(0) / 1000.0);
-        for (size_t i = 0; i < std::min<size_t>(10, sorted.size()); ++i) {
-            const auto& [start, st] = sorted[i];
-            LOG_INFO(HW_GPU,
-                     "  area [{:#x}, {:#x}) {} KiB: {} reads, {:.1f} ms waited (max {:.1f}), "
-                     "reads within [{:#x}, {:#x}), held by{}{}{}{}",
-                     start, st.end, (st.end - start) >> 10, st.reads, st.wait_us / 1000.0,
-                     st.max_us / 1000.0, st.min_read, st.max_read,
-                     (st.kinds & 1) ? " buffer" : "", (st.kinds & 2) ? " texture" : "",
-                     (st.kinds & 4) ? " query" : "", st.kinds == 0 ? " nothing" : "");
-        }
-        stats.clear();
-    }
-
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
         if (raster_area.preemtive) {
             return raster_area;
         }
         raster_area.preemtive = true;
-        // EDEN_NX2_CPUREAD_LAG=1: a page the guest CPU reads back again and again (Ocarina of
-        // Time reads one ~30-60 times a second, its exposure) is downloaded without the CPU
-        // waiting for the GPU: the read sees the value of the previous download, a frame late,
-        // instead of stalling the game thread until the GPU thread caught up. Pages read fewer
-        // than 16 times keep the synchronous flush.
-        static const bool lag_reads = [] {
-            const char* v = std::getenv("EDEN_NX2_CPUREAD_LAG");
-            return v && v[0] == '1';
-        }();
-        bool lagged = false;
-        if (lag_reads) {
-            static std::mutex lag_mutex;
-            static std::unordered_map<DAddr, u32> lag_pages;
-            std::scoped_lock lock{lag_mutex};
-            lagged = ++lag_pages[raster_area.start_address] > 16;
-        }
-        // EDEN_NX2_READ_STABLE=1 (not part of EDEN_NX2_AGGRESSIVE: in Ocarina of Time these reads
-        // are occlusion results, and a stale one hid grass and flowers near Link): a small read (8 bytes or less) whose
-        // value came back the same the last 16 times it waited is not waited for: it gets the
-        // value of the previous download, which it would have seen anyway. Every 8th such read
-        // still waits and checks; one changed value makes that word wait again.
-        static const bool stable_reads = [] {
-            const char* v = std::getenv("EDEN_NX2_READ_STABLE");
-            return v && v[0] == '1';
-        }();
-        struct StableWord {
-            u64 value{};
-            u32 same{};
-            u32 skipped{};
-        };
-        static std::mutex stable_mutex;
-        static std::unordered_map<DAddr, StableWord> stable_words;
-        const bool small_read = stable_reads && size <= 8;
-        if (small_read && !lagged) {
-            std::scoped_lock lock{stable_mutex};
-            StableWord& word = stable_words[addr];
-            if (word.same >= 16 && (++word.skipped & 7) != 0) {
-                lagged = true;
-            }
-            if (stable_words.size() > 65536) {
-                stable_words.clear();
-            }
-        }
-        static std::atomic<u64> reads{};
-        static std::atomic<u64> waited_us{};
-        static std::atomic<u64> lagged_reads{};
-        const u64 n = reads.fetch_add(1, std::memory_order_relaxed);
-        if (lagged) {
-            lagged_reads.fetch_add(1, std::memory_order_relaxed);
-        }
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
-        if ((n & 63) == 0) {
-            LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far, {} lagged, "
-                     "CPU waited {} us in all)",
-                     raster_area.start_address, raster_area.end_address, n + 1,
-                     lagged_reads.load(std::memory_order_relaxed),
-                     waited_us.load(std::memory_order_relaxed));
+        if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
+            LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far)",
+                     raster_area.start_address, raster_area.end_address,
+                     reads.load(std::memory_order_relaxed));
         }
-        const u32 readback_kinds = ReadbackKinds(raster_area);
-        // EDEN_NX2_READ_BATCH=1: the game reads a few GPU-written words back every frame, one
-        // after another (Ocarina of Time: 2 x 4 bytes, then a handful more), and each read
-        // waited for its own flush. Pages read back 8 times or more are flushed together with
-        // whichever one traps; a page the GPU writes again afterwards traps again.
-        static const bool read_batch = Nx2Aggressive() || [] {
-            const char* v = std::getenv("EDEN_NX2_READ_BATCH");
-            return v && v[0] == '1';
-        }();
-        std::vector<DAddr> batch;
-        if (read_batch) {
-            static std::mutex hot_mutex;
-            static std::unordered_map<DAddr, u32> hot_pages;
-            std::scoped_lock lock{hot_mutex};
-            u32& count = hot_pages[raster_area.start_address];
-            if (count < 1'000'000) {
-                ++count;
-            }
-            if (hot_pages.size() > 4096) {
-                hot_pages.clear();
-            }
-            for (const auto& [hot_page, hot_reads] : hot_pages) {
-                if (hot_reads >= 8 && hot_page != raster_area.start_address && batch.size() < 32) {
-                    batch.push_back(hot_page);
-                }
-            }
+        namespace AsyncReadback = VideoCore::AsyncReadback;
+        const u64 request = AsyncReadback::Now();
+        const u64 area_size = raster_area.end_address - raster_area.start_address;
+        // In flight: an earlier read's downloads cover the area, only FinishRead is left.
+        if (!raster_area.in_flight) {
+            const u64 fence = RequestSyncOperation([this, raster_area, area_size]() {
+                const u64 start = AsyncReadback::Now();
+                // Apply collected guest writes before downloading GPU data over guest memory.
+                InvalidateGPUCache();
+                renderer->ReadRasterizer()->FlushRegionForRead(raster_area.start_address,
+                                                               area_size);
+                AsyncReadback::Add(AsyncReadback::g_counters.flush_ns,
+                                   AsyncReadback::Now() - start);
+            });
+            gpu_thread.TickGPU(is_async);
+            WaitForSyncOperation(fence);
         }
-        const auto request_time = std::chrono::steady_clock::now();
-        const u64 fence = RequestSyncOperation([this, raster_area, request_time,
-                                                batch = std::move(batch)]() {
-            // With the profile: how long the read waited before the GPU thread reached it
-            // (queued work ahead of it), and how long the flush itself took (GPU and download).
-            const auto run_start = std::chrono::steady_clock::now();
-            // Apply collected guest writes before downloading GPU data over guest memory.
-            InvalidateGPUCache();
-            auto* rasterizer = renderer->ReadRasterizer();
-            rasterizer->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
-            if (VideoCommon::Nx2Profile::Enabled()) {
-                const auto run_end = std::chrono::steady_clock::now();
-                readback_queue_us.fetch_add(
-                    static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                         run_start - request_time)
-                                         .count()),
-                    std::memory_order_relaxed);
-                readback_flush_us.fetch_add(
-                    static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                         run_end - run_start)
-                                         .count()),
-                    std::memory_order_relaxed);
-            }
-            for (const DAddr batch_page : batch) {
-                if (rasterizer->MustFlushRegion(batch_page, Core::DEVICE_PAGESIZE,
-                                                VideoCommon::CacheType::BufferCache)) {
-                    rasterizer->FlushRegion(batch_page, Core::DEVICE_PAGESIZE,
-                                            VideoCommon::CacheType::BufferCache);
-                }
-            }
-        });
-        gpu_thread.TickGPU(is_async);
-        if (lagged) {
-            return raster_area;
+        // The GPU thread submitted the downloads without waiting for the host GPU: this thread
+        // waits for them and writes them to guest memory, while the GPU thread goes on.
+        AsyncReadback::t_reading = true;
+        renderer->ReadRasterizer()->FinishRead(raster_area.start_address, area_size);
+        AsyncReadback::t_reading = false;
+        AsyncReadback::CountRead(raster_area.in_flight ? AsyncReadback::Read::InFlight
+                                                       : AsyncReadback::Read::Async,
+                                 AsyncReadback::Now() - request);
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            AsyncReadback::MaybeReport();
         }
-        const auto wait_start = std::chrono::steady_clock::now();
-        WaitForSyncOperation(fence);
-        const u64 wait_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                 std::chrono::steady_clock::now() - wait_start)
-                                                 .count());
-        waited_us.fetch_add(wait_us, std::memory_order_relaxed);
-        if (small_read) {
-            u64 value = 0;
-            system.Host1x().MemoryManager().ReadBlockUnsafe(addr, &value, size);
-            std::scoped_lock lock{stable_mutex};
-            StableWord& word = stable_words[addr];
-            word.same = (word.value == value) ? word.same + 1 : 0;
-            word.value = value;
-        }
-        NoteCpuRead(raster_area, addr, size, wait_us, readback_kinds);
         return raster_area;
     }
 
@@ -602,6 +429,10 @@ struct GPU::Impl {
     VideoCommon::PendingMaps pending_maps;
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
+
+    /// InvalidateGPUCache: the writes it gathered and is applying, on each thread doing so.
+    std::vector<const std::vector<std::pair<DAddr, u64>>*> applying_writes;
+    std::mutex applying_writes_mutex;
 
     const bool is_async;
 
@@ -835,3 +666,12 @@ void GPU::FlushAndInvalidateRegion(DAddr addr, u64 size) {
 }
 
 } // namespace Tegra
+
+namespace VideoCore {
+
+bool MayHoldGpuWrites(DAddr addr, u64 size) {
+    return !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+           Tegra::Nx2MayBeGpuWritten(addr, size);
+}
+
+} // namespace VideoCore

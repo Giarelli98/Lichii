@@ -27,8 +27,6 @@ class ShaderNotify;
 
 namespace Tegra {
 
-/// EDEN_NX2_AGGRESSIVE=1: every opt-in speed switch at once.
-bool Nx2Aggressive();
 class DmaPusher;
 struct CommandList;
 

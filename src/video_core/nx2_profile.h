@@ -5,8 +5,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
-#include <cstring>
 #ifdef _MSC_VER
 #include <intrin.h>
 #elif defined(ARCHITECTURE_x86_64)
@@ -21,7 +19,9 @@
 #include "video_core/gpu_split.h"
 #include "common/logging.h"
 #include "common/cpu_features.h"
+#include "common/spin_recursive_mutex.h"
 #include "common/thread_cpu_clock.h"
+#include "video_core/nx2_stutter_trace.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
 // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
@@ -64,7 +64,16 @@ enum class Zone : u32 {
     WriterWait,
     ListSubmitWait,
     ListGpuWait,
-    DeferredCall, ///< Split GPU thread: functions the front queued for the back (Kind::Call)
+    GraphicsPipelineMiss, ///< A graphics pipeline built on the GPU thread
+    ComputePipelineMiss,  ///< A compute pipeline built on the GPU thread
+    PipelineWait,         ///< VulkanWorker: a draw or dispatch waits for its pipeline's build
+    ShaderCapture,        ///< A program the shader cache sees first: captured, lowered, hashed
+    TextureCache,         ///< Texture cache downloads, joins, blits and async flushes and decodes
+    GpuWait,              ///< Waiting for a GPU tick
+    Present,              ///< Swapchain frame acquire and present
+    WorkerIdle,           ///< VulkanWorker waiting for work
+    PresentWait,          ///< Present waits for the Vulkan worker or a free presentation frame
+    QueueSubmit,          ///< vkQueueSubmit
     Count,
 };
 
@@ -76,16 +85,61 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait",
-    "writer wait", "list submit wait", "list GPU wait", "deferred call",
+    "writer wait", "list submit wait", "list GPU wait", "graphics pipeline miss",
+    "compute pipeline miss", "pipeline wait", "shader capture", "texture cache", "GPU wait",
+    "present", "worker idle",
+    "present wait", "queue submit",
 };
+
+static_assert(static_cast<size_t>(Zone::Count) <= StutterTrace::ZoneSlots);
+
+/// The EDEN_NX2_STUTTER_TRACE category of each zone's exclusive time (None: counted as other).
+inline constexpr auto stutter_categories = [] {
+    using StutterTrace::Category;
+    std::array<Category, static_cast<size_t>(Zone::Count)> categories;
+    categories.fill(Category::None);
+    const auto set = [&categories](Zone zone, Category category) {
+        categories[static_cast<size_t>(zone)] = category;
+    };
+    set(Zone::Idle, Category::Idle);
+    set(Zone::PendingSleep, Category::Idle);
+    set(Zone::SplitDrain, Category::Idle);
+    set(Zone::SplitWait, Category::Idle);
+    set(Zone::WriterWait, Category::Idle);
+    set(Zone::WorkerIdle, Category::Idle);
+    set(Zone::GraphicsPipelineMiss, Category::GraphicsMiss);
+    set(Zone::ComputePipelineMiss, Category::ComputeMiss);
+    set(Zone::PipelineWait, Category::PipelineWait);
+    set(Zone::ShaderCapture, Category::ShaderCapture);
+    set(Zone::SyncDescriptors, Category::TextureCache);
+    set(Zone::FillImageViews, Category::TextureCache);
+    set(Zone::RenderTargets, Category::TextureCache);
+    set(Zone::TextureUpload, Category::TextureCache);
+    set(Zone::TextureCache, Category::TextureCache);
+    set(Zone::TextureBuffers, Category::BufferCache);
+    set(Zone::UpdateBuffers, Category::BufferCache);
+    set(Zone::BindStageBuffers, Category::BufferCache);
+    set(Zone::Fence, Category::QueryFence);
+    set(Zone::ListSubmitWait, Category::QueryFence);
+    set(Zone::ListGpuWait, Category::QueryFence);
+    set(Zone::GpuWait, Category::QueryFence);
+    set(Zone::Present, Category::Present);
+    set(Zone::PresentWait, Category::Present);
+    return categories;
+}();
 
 // A plain flag: Enabled() runs several times per method write (no guard to check).
 inline bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+/// Whether zones measure: for the profile or for EDEN_NX2_STUTTER_TRACE.
+inline bool g_zones_enabled = g_enabled || StutterTrace::ReadEnv();
 
 /// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
 /// nx2_switches.txt, so a switch set only there takes effect from that point on.
 inline void ReadSwitch() {
     g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+    StutterTrace::ReadSwitch();
+    g_zones_enabled = g_enabled || StutterTrace::Enabled();
+    Common::g_count_spin_contention = g_enabled;
 }
 
 inline bool Enabled() {
@@ -112,9 +166,13 @@ inline u64 Ticks() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 13> counters{}; ///< See Counter
+    std::array<u64, 8> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
+    /// GPU waits by the zone they happened in (Other: outside every zone)
+    std::array<u64, static_cast<size_t>(Zone::Count)> gpu_wait_ns{};
+    std::array<u64, static_cast<size_t>(Zone::Count)> gpu_wait_count{};
+    Zone current{Zone::Other};
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
     u64 window_start_ticks{};
@@ -123,38 +181,47 @@ struct ThreadData {
 
 inline thread_local ThreadData t_data;
 
-/// Hitch report: the zone totals when Report last ran on this thread. A gap of 40 ms or more
-/// between two Report calls (one command, or one wait, that long) is logged with the zone or
-/// drain site that took most of it: what a stutter on this thread was.
-struct HitchSnapshot {
-    u64 now{};
-    u64 ticks{};
-    std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
-    std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
-};
-inline thread_local HitchSnapshot t_hitch;
-
 class Scope {
 public:
-    explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
+    explicit Scope(Zone zone_) : zone{zone_}, enabled{g_zones_enabled} {
         if (!enabled) {
             return;
         }
         parent_child_ns = t_data.child_ns;
         t_data.child_ns = 0;
+        parent = t_data.current;
+        t_data.current = zone;
         start = Ticks();
+        traced = StutterTrace::Enabled();
+        if (traced) {
+            outer = StutterTrace::Open(stutter_categories[static_cast<size_t>(zone)], start,
+                                       static_cast<size_t>(zone));
+        }
     }
 
     ~Scope() {
         if (!enabled) {
             return;
         }
-        const u64 elapsed = Ticks() - start;
+        const u64 end = Ticks();
+        const u64 elapsed = end - start;
         auto& data = t_data;
         const auto index = static_cast<size_t>(zone);
-        data.exclusive_ns[index] += elapsed - data.child_ns;
+        const u64 exclusive = elapsed - data.child_ns;
+        data.exclusive_ns[index] += exclusive;
         ++data.count[index];
         data.child_ns = parent_child_ns + elapsed;
+        data.current = parent;
+        if (zone == Zone::GpuWait) {
+            data.gpu_wait_ns[static_cast<size_t>(parent)] += elapsed;
+            ++data.gpu_wait_count[static_cast<size_t>(parent)];
+        }
+        if (traced) {
+            // Time outside every zone is no zone's: it may be a wait no zone covers.
+            StutterTrace::Close(outer, end,
+                                parent == Zone::Other ? StutterTrace::ZoneSlots
+                                                      : static_cast<size_t>(parent));
+        }
     }
 
     Scope(const Scope&) = delete;
@@ -162,7 +229,10 @@ public:
 
 private:
     Zone zone;
+    Zone parent{Zone::Other};
     bool enabled;
+    bool traced{};
+    StutterTrace::Category outer{StutterTrace::Category::None};
     u64 start{};
     u64 parent_child_ns{};
 };
@@ -177,11 +247,6 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
-    AcquirePolls,
-    AcquirePollsLatched,
-    AcquirePollsDeferred,
-    AcquirePollsDrained,
-    AcquireFenceRetries,
 };
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
@@ -253,56 +318,13 @@ inline void AddDrain(DrainSite site, u64 start) {
 
 /// Called by the GPU thread (and the split's back thread) between commands: logs and resets
 /// the totals every 10 s.
-inline void Report(const char* thread_name = "GPU thread") {
+/// `report_all_contention`: also log (and reset) every thread's spin mutex contention.
+inline void Report(const char* thread_name = "GPU thread", bool report_all_contention = false) {
     if (!Enabled()) {
         return;
     }
     auto& data = t_data;
     const u64 now = Now();
-    if (auto& hitch = t_hitch; hitch.now != 0 && now - hitch.now >= 40'000'000ULL &&
-                               data.window_start != 0) {
-        const u64 ticks = Ticks();
-        const double ns_per_tick = static_cast<double>(now - hitch.now) /
-                                   static_cast<double>((std::max<u64>)(ticks - hitch.ticks, 1));
-        size_t zone = 0;
-        u64 zone_delta = 0;
-        for (size_t i = 1; i < data.exclusive_ns.size(); ++i) {
-            const u64 delta = data.exclusive_ns[i] - (std::min)(hitch.exclusive_ns[i], data.exclusive_ns[i]);
-            if (delta > zone_delta) {
-                zone_delta = delta;
-                zone = i;
-            }
-        }
-        size_t site = 0;
-        u64 site_delta = 0;
-        for (size_t i = 0; i < data.drain_ns.size(); ++i) {
-            const u64 delta = data.drain_ns[i] - (std::min)(hitch.drain_ns[i], data.drain_ns[i]);
-            if (delta > site_delta) {
-                site_delta = delta;
-                site = i;
-            }
-        }
-        // Waiting for work (the guest's next commands, or the front) is a stutter elsewhere:
-        // logged too, under its own limit.
-        const bool waiting = std::strcmp(zone_names[zone], "idle") == 0 ||
-                             std::strcmp(zone_names[zone], "split wait") == 0 ||
-                             std::strcmp(zone_names[zone], "pending sleep") == 0;
-        static std::atomic<u32> hitches{};
-        static std::atomic<u32> waiting_hitches{};
-        if ((waiting ? waiting_hitches : hitches).fetch_add(1, std::memory_order_relaxed) <
-            (waiting ? 150U : 400U)) {
-            LOG_INFO(HW_GPU, "{} hitch: {:.1f} ms in one step; most in zone {} ({:.1f} ms), "
-                     "longest wait for the back {} ({:.1f} ms)",
-                     thread_name, static_cast<double>(now - hitch.now) / 1e6, zone_names[zone],
-                     static_cast<double>(zone_delta) * ns_per_tick / 1e6,
-                     site_delta != 0 ? drain_site_names[site] : "none",
-                     static_cast<double>(site_delta) * ns_per_tick / 1e6);
-        }
-    }
-    t_hitch.now = now;
-    t_hitch.ticks = Ticks();
-    t_hitch.exclusive_ns = data.exclusive_ns;
-    t_hitch.drain_ns = data.drain_ns;
     if (data.window_start == 0) {
         data.window_start = now;
         data.window_start_ticks = Ticks();
@@ -342,15 +364,9 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | 3D register writes {:.0f} ({:.0f} same value)",
                         static_cast<double>(data.counters[4]) * 1e9 / window,
                         static_cast<double>(data.counters[5]) * 1e9 / window);
-    line += fmt::format(" | acquires {:.0f} ({:.0f} waited, {:.0f} polls, {:.0f} latched fast)",
+    line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
-                        static_cast<double>(data.counters[7]) * 1e9 / window,
-                        static_cast<double>(data.counters[8]) * 1e9 / window,
-                        static_cast<double>(data.counters[9]) * 1e9 / window);
-    line += fmt::format(" | acquire polls deferred {:.0f}, drained {:.0f}, fence retries {:.0f}",
-                        static_cast<double>(data.counters[10]) * 1e9 / window,
-                        static_cast<double>(data.counters[11]) * 1e9 / window,
-                        static_cast<double>(data.counters[12]) * 1e9 / window);
+                        static_cast<double>(data.counters[7]) * 1e9 / window);
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
         if (data.drain_count[i] != 0) {
@@ -362,6 +378,36 @@ inline void Report(const char* thread_name = "GPU thread") {
     if (!drains.empty()) {
         drains.pop_back();
         line += " | waits for the back by site:" + drains;
+    }
+    std::string gpu_waits;
+    for (size_t i = 0; i < data.gpu_wait_count.size(); ++i) {
+        if (data.gpu_wait_count[i] != 0) {
+            gpu_waits += fmt::format(" {} {:.1f} ms ({:.0f}/s),", zone_names[i],
+                                     static_cast<double>(data.gpu_wait_ns[i]) * 1000.0 / window_ticks,
+                                     static_cast<double>(data.gpu_wait_count[i]) * 1e9 / window);
+        }
+    }
+    if (!gpu_waits.empty()) {
+        gpu_waits.pop_back();
+        line += " | GPU waits by zone:" + gpu_waits;
+    }
+    {
+        auto& own = Common::t_spin_contention;
+        auto& all = Common::g_spin_contention;
+        line += fmt::format(
+            " | spin mutex contention: this thread {:.0f}/s {:.1f} ms ({:.0f} sleeps/s)",
+            static_cast<double>(own.count) * 1e9 / window, static_cast<double>(own.ns) / 1e6 * 1e9 / window,
+            static_cast<double>(own.sleeps) * 1e9 / window);
+        own = {};
+        if (report_all_contention) {
+            const u64 count = all.count.exchange(0, std::memory_order_relaxed);
+            const u64 ns = all.ns.exchange(0, std::memory_order_relaxed);
+            const u64 sleeps = all.sleeps.exchange(0, std::memory_order_relaxed);
+            line += fmt::format(", all threads {:.0f}/s {:.1f} ms ({:.0f} sleeps/s)",
+                                static_cast<double>(count) * 1e9 / window,
+                                static_cast<double>(ns) / 1e6 * 1e9 / window,
+                                static_cast<double>(sleeps) * 1e9 / window);
+        }
     }
     if (cpu_now && data.cpu_start_ns && *cpu_now >= *data.cpu_start_ns) {
         line += fmt::format(" | host_cpu_busy_ms_per_s={:.3f} window_wall_ms={:.3f}",
@@ -381,7 +427,9 @@ inline void Report(const char* thread_name = "GPU thread") {
     t_method_count = {};
     t_method_same = {};
     t_dma_reads = {};
+    const Zone current = data.current;
     data = {};
+    data.current = current;
     data.window_start = now;
     data.window_start_ticks = now_ticks;
     data.cpu_start_ns = cpu_now;
